@@ -89,7 +89,7 @@ async def match_one(name: str) -> Match:
         # mas se nem trgm achou nada com 0.35, provavelmente é "no match"
         return Match(None, None, top_score, "none", alternatives)
 
-    rerank_model = os.environ.get("OPENROUTER_RERANK_MODEL", "google/gemma-2-9b-it:free")
+    rerank_model = os.environ.get("OPENROUTER_RERANK_MODEL", "google/gemma-4-31b-it")
     try:
         chosen_id = await llm.rerank(name, [{"id": c["id"], "name": c["name"]} for c in cands], rerank_model)
     except Exception:

@@ -1,4 +1,5 @@
 # .env
+!.env.example
 .venv/
 venv/
 __pycache__/
@@ -7,5 +8,19 @@ __pycache__/
 *.db
 .idea/
 .vscode/
+
+# LaTeX build artifacts
+slides/build/
+*.aux
+*.log
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+*.toc
+*.out
+*.nav
+*.snm
+*.vrb
 .claude/
 .gemini/
+slides/

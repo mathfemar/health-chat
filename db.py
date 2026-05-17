@@ -152,3 +152,12 @@ async def get_food(food_id: int) -> dict | None:
 async def count_foods() -> int:
     async with pool().acquire() as conn:
         return await conn.fetchval("select count(*) from foods")
+
+
+async def close_active_conversation(user_id: int) -> None:
+    """Marca conversa ativa do usuário como closed. Próxima msg cria nova."""
+    async with pool().acquire() as conn:
+        await conn.execute(
+            "update conversations set state='closed' where user_id=$1 and state='active'",
+            user_id,
+        )
