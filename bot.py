@@ -20,6 +20,7 @@ import calculator
 import db
 import llm
 import matcher
+from agent import runtime as agent
 
 load_dotenv()
 
@@ -45,12 +46,12 @@ def _current_model(context: ContextTypes.DEFAULT_TYPE) -> str:
 
 
 def _source_emoji(source: str) -> str:
-    return {"TACO": "✅", "estimativa": "🟡", "sem dados": "❌"}.get(source, "•")
+    return {"TACO": "✅", "VITAT": "🌿", "estimativa": "🟡", "sem dados": "❌"}.get(source, "•")
 
 
 def _format_meal_message(meal_id: int, items: list[dict], totals: dict, model: str, notes: str | None) -> str:
     lines = []
-    for i, it in enumerate(items):
+    for it in items:
         emoji = _source_emoji(it["source"])
         matched = it.get("food_name") or "(sem match)"
         lines.append(
@@ -71,7 +72,6 @@ def _format_meal_message(meal_id: int, items: list[dict], totals: dict, model: s
 
 def _meal_keyboard(meal_id: int, items: list[dict]) -> InlineKeyboardMarkup:
     rows = []
-    # botão de correção por item (até 8)
     for i, it in enumerate(items[:8]):
         if it.get("alternatives"):
             rows.append([InlineKeyboardButton(
@@ -82,8 +82,9 @@ def _meal_keyboard(meal_id: int, items: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-# ----------------- comandos -----------------
-
+# ============================================================
+# Comandos
+# ============================================================
 
 async def cmd_start(update: Update, _) -> None:
     u = update.effective_user
@@ -91,22 +92,29 @@ async def cmd_start(update: Update, _) -> None:
     n = await db.count_foods()
     await update.message.reply_text(
         f"Oi! Seu user_id é {u.id}.\n"
-        f"Base nutricional carregada: {n} alimentos (TACO).\n\n"
-        "Manda uma foto que eu estimo macros usando a base.\n"
-        "Comandos: /hoje /semana /apagar /modelo /buscar /ajuda"
+        f"Base nutricional: {n} alimentos.\n\n"
+        "📷 Manda foto de prato → análise automática\n"
+        "💬 Manda texto (com ou sem foto) → conversa com o agente\n\n"
+        "Comandos: /hoje /semana /apagar /modelo /buscar /reset /ajuda"
     )
 
 
 async def cmd_ajuda(update: Update, _) -> None:
     if not _guard(update): return
     await update.message.reply_text(
-        "📷 Foto → identifico itens, busco no TACO, calculo macros\n"
-        "✅ = match TACO  ·  🟡 = estimativa LLM  ·  ❌ = sem dados\n\n"
+        "📷 <b>Foto só</b> → análise automática (TACO + Vitat).\n"
+        "💬 <b>Texto livre</b> ou <b>texto+foto</b> → agente conversacional. Ex:\n"
+        "   • 'foto do cardápio, quero algo com carne'\n"
+        "   • 'comi a mesma coisa de ontem com mais arroz'\n"
+        "   • 'tô em 1500 kcal, o que comer no jantar?'\n\n"
+        "✅ TACO  🌿 Vitat  🟡 estimativa  ❌ sem dados\n\n"
         "/hoje — refeições e total do dia\n"
         "/semana — total dos últimos 7 dias\n"
         "/apagar — remove última refeição\n"
         "/modelo [slug] — vê/troca modelo de visão\n"
-        "/buscar <termo> — procura no banco TACO\n"
+        "/buscar &lt;termo&gt; — busca no banco\n"
+        "/reset — começa nova conversa com o agente",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -115,9 +123,12 @@ async def cmd_modelo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if context.args:
         new = " ".join(context.args).strip()
         context.bot_data["model"] = new
-        await update.message.reply_text(f"Modelo agora: {new}")
+        await update.message.reply_text(f"Modelo de visão agora: {new}")
     else:
-        await update.message.reply_text(f"Modelo atual: {_current_model(context)}")
+        await update.message.reply_text(
+            f"Visão: {_current_model(context)}\n"
+            f"Chat (agente): {os.environ.get('OPENROUTER_CHAT_MODEL', 'google/gemma-4-31b-it')}"
+        )
 
 
 async def cmd_buscar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -181,15 +192,31 @@ async def cmd_apagar(update: Update, _) -> None:
     await update.message.reply_text(f"Removido #{d}." if d else "Nada pra apagar.")
 
 
-# ----------------- foto / callbacks -----------------
+async def cmd_reset(update: Update, _) -> None:
+    """Fecha a conversa atual com o agente. Próxima msg cria uma nova."""
+    if not _guard(update): return
+    await db.close_active_conversation(update.effective_user.id)
+    await update.message.reply_text("Conversa zerada. 🔄 Próxima mensagem começa do zero.")
 
+
+# ============================================================
+# Fotos e mensagens
+# ============================================================
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Foto sem caption → fluxo automático (legado). Foto com caption → agente."""
     if not _guard(update): return
     msg = update.message
-    await msg.chat.send_action(ChatAction.TYPING)
-
+    caption = (msg.caption or "").strip()
     photo = msg.photo[-1]
+
+    if caption:
+        # Foto + texto: deixa o agente decidir o que fazer
+        await _agent_handle(update, context, text=caption, photo_file_id=photo.file_id)
+        return
+
+    # Foto sem texto: análise automática (comportamento original)
+    await msg.chat.send_action(ChatAction.TYPING)
     file = await context.bot.get_file(photo.file_id)
     buf = io.BytesIO()
     await file.download_to_memory(out=buf)
@@ -224,13 +251,46 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         totals=totals,
         notes=analysis.get("notes"),
     )
-
     await msg.reply_text(
         _format_meal_message(meal_id, resolved, totals, model, analysis.get("notes")),
         parse_mode=ParseMode.HTML,
         reply_markup=_meal_keyboard(meal_id, resolved),
     )
 
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _guard(update): return
+    await _agent_handle(update, context, text=update.message.text, photo_file_id=None)
+
+
+async def _agent_handle(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                        text: str, photo_file_id: str | None) -> None:
+    """Rota pro agente conversacional."""
+    msg = update.message
+    await msg.chat.send_action(ChatAction.TYPING)
+    try:
+        reply = await agent.run_turn(
+            user_id=update.effective_user.id,
+            user_text=text,
+            photo_file_id=photo_file_id,
+            bot=context.bot,
+            vision_model=_current_model(context),
+        )
+    except Exception as e:
+        log.exception("agent.run_turn failed")
+        await msg.reply_text(f"Agente quebrou: {e}")
+        return
+
+    # Tenta enviar como HTML; se falhar (entidades quebradas), envia como texto puro
+    try:
+        await msg.reply_text(reply, parse_mode=ParseMode.HTML)
+    except Exception:
+        await msg.reply_text(reply)
+
+
+# ============================================================
+# Callbacks (botões inline)
+# ============================================================
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _guard(update): return
@@ -297,10 +357,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
 
-async def on_text(update: Update, _) -> None:
-    if not _guard(update): return
-    await update.message.reply_text("Manda uma foto. /ajuda pra comandos.")
-
+# ============================================================
+# Lifecycle
+# ============================================================
 
 async def _post_init(app: Application) -> None:
     await db.init()
@@ -331,11 +390,14 @@ def main() -> None:
     app.add_handler(CommandHandler("apagar", cmd_apagar))
     app.add_handler(CommandHandler("modelo", cmd_modelo))
     app.add_handler(CommandHandler("buscar", cmd_buscar))
+    app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    log.info("Bot rodando.")
+    log.info("Bot rodando. Visão: %s | Chat: %s",
+             os.environ.get("OPENROUTER_MODEL"),
+             os.environ.get("OPENROUTER_CHAT_MODEL", "google/gemma-4-31b-it"))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
