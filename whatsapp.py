@@ -310,10 +310,50 @@ async def twilio_webhook(request: Request) -> PlainTextResponse:
     )
 
 
+def _format_suggestions_as_text(suggestions: list[commands.Suggestion]) -> str:
+    """Renderiza Suggestion[] como texto pro WhatsApp sandbox (sem botões).
+
+    Quando virar produção com Content Templates aprovados, troca por
+    `_send_suggestions_as_quick_replies` (TODO abaixo).
+    """
+    if not suggestions:
+        return ""
+    items = " · ".join(f"`{s.command}` ({s.label})" for s in suggestions)
+    return f"\n\n💡 Atalhos: {items}"
+
+
+# TODO: implementação futura com Twilio Content API (Quick Reply Buttons).
+# Quando você sair do sandbox e tiver Content Templates aprovados, troque
+# _format_suggestions_as_text por esta função no _send_command_result.
+#
+# async def _send_suggestions_as_quick_replies(from_phone, text, suggestions):
+#     from twilio.rest import Client
+#     client = Client(*_twilio_auth())
+#     content_sid = os.environ["TWILIO_CONTENT_SID_QUICK_REPLY_3"]
+#     content_vars = {"1": text, "2": suggestions[0].label, ...}
+#     client.messages.create(
+#         from_=os.environ["TWILIO_WHATSAPP_FROM"],
+#         to=f"whatsapp:{_phone_normalize(from_phone)}",
+#         content_sid=content_sid,
+#         content_variables=json.dumps(content_vars),
+#     )
+
+
 async def _send_command_result(from_phone: str, r: commands.CommandResult) -> None:
-    """Envia CommandResult pro WhatsApp: texto (convertendo HTML→WA) + foto (via stash_media)."""
+    """Envia CommandResult pro WhatsApp: texto (convertendo HTML→WA) + foto +
+    sugestões (como texto enquanto sandbox; substituir por Quick Reply Buttons
+    quando migrar pra Content API em produção)."""
     if r.text:
-        await send_whatsapp_message(from_phone, body=tg_html_to_whatsapp(r.text))
+        body = tg_html_to_whatsapp(r.text)
+        if r.suggestions:
+            body += _format_suggestions_as_text(r.suggestions)
+        await send_whatsapp_message(from_phone, body=body)
+    elif r.suggestions:
+        # sugestões sem texto antes — manda só as sugestões
+        await send_whatsapp_message(
+            from_phone,
+            body=_format_suggestions_as_text(r.suggestions).lstrip(),
+        )
     if r.png:
         try:
             url = stash_media(r.png, "image/png")
