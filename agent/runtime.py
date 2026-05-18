@@ -82,6 +82,21 @@ async def _load_messages(conv_id: int) -> list[dict]:
     return out
 
 
+async def _last_photo_id(conv_id: int) -> str | None:
+    """Última photo_file_id que veio nessa conversa (das últimas 5 msgs)."""
+    pool = db.pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            select photo_file_id from messages
+            where conversation_id=$1 and photo_file_id is not null
+            order by created_at desc limit 1
+            """,
+            conv_id,
+        )
+    return row["photo_file_id"] if row else None
+
+
 async def _load_summary(conv_id: int) -> str | None:
     pool = db.pool()
     async with pool.acquire() as conn:
@@ -127,20 +142,33 @@ async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
         "conv_id": conv_id,
         "bot": bot,
         "vision_model": vision_model,
+        # Foto desta msg (ou da última, recuperada do DB se nesta não veio)
+        "latest_photo_id": photo_file_id or await _last_photo_id(conv_id),
     }
 
     # 3. loop de tool calling
     final_text: str | None = None
+    tool_history: list[tuple[str, dict, dict]] = []  # (name, args, result) — pra fallback summary
     for step in range(MAX_TOOL_CALLS_PER_TURN + 1):
         history = await _load_messages(conv_id)
         messages = [system_msg] + history
-        payload = {
+
+        # Se estoura o limite, força resposta final SEM tools no payload
+        force_final = step >= MAX_TOOL_CALLS_PER_TURN
+        payload: dict = {
             "model": _chat_model(),
             "messages": messages,
-            "tools": registry.openai_schema(),
-            "tool_choice": "auto",
             "temperature": 0.3,
         }
+        if not force_final:
+            payload["tools"] = registry.openai_schema()
+            payload["tool_choice"] = "auto"
+        else:
+            # Injeta instrução pra fechar
+            messages.append({
+                "role": "system",
+                "content": "[Limite de tool calls atingido. RESPONDA AGORA ao usuário em texto, com o que você já sabe. Não chame mais tools.]"
+            })
 
         try:
             raw = await _post_openrouter(payload)
@@ -161,7 +189,7 @@ async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
         )
 
         if not tool_calls:
-            final_text = text or "(sem resposta)"
+            final_text = text
             break
 
         # executa cada tool e salva resultado
@@ -179,17 +207,56 @@ async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
             except Exception as e:
                 log.exception("tool %s falhou", name)
                 result = {"error": str(e), "hint": "Tente outra abordagem ou ferramenta."}
-            # tool result: serializa, limita tamanho
+            tool_history.append((name, args, result))
             result_str = json.dumps(result, ensure_ascii=False, default=str)
             if len(result_str) > 8000:
                 result_str = result_str[:8000] + '..."<truncated>"'
             await add_message(conv_id, "tool", content=result_str, tool_call_id=tc_id)
 
-        if step >= MAX_TOOL_CALLS_PER_TURN - 1:
-            # forçar uma resposta final na próxima iter
-            await add_message(
-                conv_id, "system",
-                content="[Limite de chamadas atingido — responda ao usuário com o que você já sabe]",
-            )
+    # Fallback final: se LLM nunca produziu texto, sintetiza um a partir do que fez.
+    if not final_text:
+        final_text = _synthesize_fallback_text(tool_history)
+    return final_text
 
-    return final_text or "(turno sem texto final)"
+
+def _synthesize_fallback_text(tool_history: list[tuple[str, dict, dict]]) -> str:
+    """Quando o modelo executa ações mas esquece de escrever texto final,
+    montamos uma confirmação a partir do que realmente aconteceu."""
+    if not tool_history:
+        return "(sem resposta)"
+
+    # Procura a última ação confirmadora bem-sucedida
+    for name, _args, result in reversed(tool_history):
+        if not isinstance(result, dict) or result.get("error"):
+            continue
+        if name == "log_meal":
+            totals = result.get("totals", {})
+            kcal = totals.get("kcal", 0)
+            p = totals.get("protein_g", 0)
+            mid = result.get("meal_id", "?")
+            return (f"✅ Refeição #{mid} logada: <b>{kcal:.0f} kcal</b> "
+                    f"({p:.0f}g proteína).")
+        if name == "log_exercise":
+            return (f"✅ Exercício registrado: <b>{result.get('activity','?')}</b> "
+                    f"— {result.get('kcal_burned','?')} kcal queimadas.")
+        if name == "log_weight":
+            gu = result.get("goal_update") or {}
+            base = f"✅ Peso {result.get('weight_kg','?')} kg registrado."
+            if gu.get("new_daily_kcal"):
+                base += (f" Nova meta calórica: <b>{gu['new_daily_kcal']} kcal/dia</b>"
+                         + (f" (Δ {gu.get('delta_kcal',0):+d})" if gu.get("delta_kcal") else "")
+                         + ".")
+            return base
+        if name == "set_profile":
+            return f"✅ {result.get('field','?')} salvo: {result.get('value','?')}."
+        if name == "compute_daily_goal":
+            return (f"🎯 Meta calculada: <b>{result.get('daily_kcal','?')} kcal/dia</b> "
+                    f"— {result.get('protein_g','?')}g proteína, "
+                    f"{result.get('carbs_g','?')}g carbo, "
+                    f"{result.get('fat_g','?')}g gordura.")
+
+    # Nenhuma ação reconhecível — mostra fallback genérico
+    done = ", ".join(n for n, _, _ in tool_history[-4:])
+    return ("Processei sua mensagem mas o modelo não fechou com texto. "
+            f"Ferramentas chamadas: <code>{done}</code>. "
+            "Tenta reformular se faltar algo.")
