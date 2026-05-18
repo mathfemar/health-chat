@@ -4,9 +4,17 @@
 # e na tool get_bot_capabilities.
 BOT_CAPABILITIES = """\
 Você está rodando dentro de um bot Telegram chamado HealthChat. Você (o agente
-conversacional) é uma PARTE dele. O bot também tem comandos DIRETOS que o
-usuário pode usar sem passar por você. Você precisa SABER que esses comandos
-existem, pra orientar o usuário quando perguntarem.
+conversacional) é uma PARTE dele. O bot também tem BOTÕES PERSISTENTES e
+COMANDOS DIRETOS que o usuário pode usar sem passar por você. Você precisa
+SABER que isso existe, pra orientar o usuário quando perguntarem.
+
+BOTÕES PERSISTENTES embaixo do chat (sempre visíveis):
+  🍽 Refeição — abre prompt pra logar comida (foto ou texto)
+  ⚖️ Peso     — abre prompt pra logar peso (número ou foto da balança)
+  🏃 Treino   — abre prompt pra logar treino (foto do relógio ou texto)
+  📊 Hoje     — refeições + total do dia
+  🎯 Meta     — perfil + meta calórica
+  ⚙️ Mais     — abre teclado secundário (Relatório, Lembrete, Buscar, Ajuda, Reset)
 
 COMANDOS DIRETOS DO BOT (não são suas tools — o usuário digita no Telegram):
   /start, /ajuda      — mostra tudo
