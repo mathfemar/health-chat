@@ -27,10 +27,28 @@ log = logging.getLogger("health-chat.commands")
 
 
 @dataclass
+class Suggestion:
+    """Sugestão clicável anexada a uma mensagem.
+
+    Renderiza diferente por canal:
+    - Telegram: vira InlineKeyboardButton com callback_data
+    - WhatsApp (sandbox/hoje): vira linha extra de texto "💡 Atalhos: /cmd1 · /cmd2"
+    - WhatsApp (produção/futuro): vira Quick Reply Button via Content Template
+
+    label: texto curto pro botão (max ~20 chars)
+    command: o slash command (com args) que deve rodar ao clicar.
+             Ex: '/apagar 12', '/trocar 12 1'.
+    """
+    label: str
+    command: str
+
+
+@dataclass
 class CommandResult:
     """Resultado de um comando, agnóstico de canal."""
-    text: str | None = None        # HTML do Telegram (canal converte se precisa)
-    png: bytes | None = None       # imagem opcional (gráficos)
+    text: str | None = None                # HTML do Telegram (canal converte)
+    png: bytes | None = None               # imagem opcional (gráficos)
+    suggestions: list[Suggestion] | None = None  # ações sugeridas (botões)
 
 
 def _esc(s) -> str:
@@ -163,7 +181,11 @@ async def cmd_hoje(user_id: int, args: list[str]) -> CommandResult:
         f"<b>Hoje</b> ({len(meals)} refeições)\n" + "\n".join(lines) +
         f"\n\n🔥 <b>{tot_k:.0f} kcal</b>\nP {tot_p:.0f}  C {tot_c:.0f}  G {tot_f:.0f}"
     )
-    return CommandResult(text=text)
+    suggestions = [
+        Suggestion(label="📊 Gráfico", command="/grafico"),
+        Suggestion(label="🗑 Apagar última", command="/apagar"),
+    ]
+    return CommandResult(text=text, suggestions=suggestions)
 
 
 # ============================================================

@@ -213,9 +213,20 @@ def _meal_keyboard(meal_id: int, items: list[dict]) -> InlineKeyboardMarkup:
 # Comandos — lógica em commands.py (agnóstica de canal)
 # ============================================================
 
+def _suggestions_to_inline_kb(suggestions: list[commands.Suggestion]) -> InlineKeyboardMarkup:
+    """Converte Suggestion[] em InlineKeyboardMarkup (botões clicáveis no Telegram).
+    Cada botão dispara on_callback com data 'cmd:<command>'."""
+    rows = [[InlineKeyboardButton(s.label, callback_data=f"cmd:{s.command}")]
+            for s in suggestions]
+    return InlineKeyboardMarkup(rows)
+
+
 async def _send_result(update: Update, r: commands.CommandResult,
                        reply_markup=None) -> None:
-    """Envia CommandResult: texto HTML (se houver) + foto (se houver)."""
+    """Envia CommandResult: texto HTML + foto + sugestões (inline keyboard)."""
+    # Se há sugestões e o caller não definiu reply_markup, usa as sugestões.
+    if r.suggestions and reply_markup is None:
+        reply_markup = _suggestions_to_inline_kb(r.suggestions)
     if r.text:
         try:
             await update.message.reply_text(
@@ -460,6 +471,35 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await q.answer()
     data = q.data or ""
     user_id = update.effective_user.id
+
+    # cmd:<slash_command> — dispatch genérico de Suggestion (botão de sugestão)
+    if data.startswith("cmd:"):
+        slash = data[len("cmd:"):].strip()
+        parsed = commands.parse_slash(slash if slash.startswith("/") else f"/{slash}")
+        if not parsed:
+            await q.message.reply_text(f"Comando inválido: {slash}")
+            return
+        cmd_name, args = parsed
+        handler = commands.COMMAND_HANDLERS.get(cmd_name)
+        if not handler:
+            await q.message.reply_text(f"Comando /{cmd_name} não reconhecido.")
+            return
+        try:
+            r = await handler(user_id, args)
+        except Exception as e:
+            log.exception("erro executando suggestion /%s", cmd_name)
+            await q.message.reply_text(f"Erro em /{cmd_name}: {e}")
+            return
+        # Re-usa _send_result-like inline (sem o update.message direto)
+        markup = _suggestions_to_inline_kb(r.suggestions) if r.suggestions else None
+        if r.text:
+            try:
+                await q.message.reply_text(r.text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            except Exception:
+                await q.message.reply_text(r.text, reply_markup=markup)
+        if r.png:
+            await q.message.reply_photo(photo=io.BytesIO(r.png))
+        return
 
     if data.startswith("del:"):
         meal_id = int(data.split(":")[1])
