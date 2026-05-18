@@ -23,6 +23,24 @@ async def init() -> None:
         init=_init_conn,
         statement_cache_size=0,  # Supabase Transaction pooler (pgbouncer) não aceita prepared stmts
     )
+    await _apply_lightweight_migrations()
+
+
+async def _apply_lightweight_migrations() -> None:
+    """ALTERs idempotentes pra evolução de schema sem destruir dados.
+    Não substitui import_taco.py (que recria do zero) — só adiciona colunas novas."""
+    migrations = [
+        "alter table user_profiles add column if not exists weigh_in_minute int default 0",
+    ]
+    async with _pool.acquire() as conn:
+        for sql in migrations:
+            try:
+                await conn.execute(sql)
+            except Exception as e:
+                # tabela pode não existir ainda (ex: primeira execução)
+                # nesse caso import_taco vai criar com o schema certo
+                import logging
+                logging.getLogger("db").warning("migration skipped: %s (%s)", sql, e)
 
 
 async def close() -> None:
@@ -182,6 +200,7 @@ _PROFILE_CONVERTERS = {
     "target_weight_kg":  float,
     "weekly_rate_kg":    float,
     "weigh_in_hour":     int,
+    "weigh_in_minute":   int,
     "weigh_in_enabled":  lambda v: bool(v) if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes", "sim"),
     # string fields ficam sem converter
 }
@@ -193,7 +212,8 @@ async def upsert_profile_field(user_id: int, field: str, value) -> None:
         "name", "sex", "birth_date", "height_cm", "current_weight_kg",
         "target_weight_kg", "activity_level", "weekly_rate_kg", "eatback_pct",
         "daily_kcal", "daily_protein_g", "preferences",
-        "weigh_in_enabled", "weigh_in_hour", "weigh_in_tz", "weigh_in_last_date",
+        "weigh_in_enabled", "weigh_in_hour", "weigh_in_minute",
+        "weigh_in_tz", "weigh_in_last_date",
     }
     if field not in allowed:
         raise ValueError(f"Campo não permitido: {field}")
@@ -247,7 +267,7 @@ async def users_due_for_weigh_in_reminder() -> list[dict]:
     async with pool().acquire() as conn:
         rows = await conn.fetch(
             """
-            select user_id, weigh_in_hour, weigh_in_tz, weigh_in_last_date
+            select user_id, weigh_in_hour, weigh_in_minute, weigh_in_tz, weigh_in_last_date
             from user_profiles
             where weigh_in_enabled = true and weigh_in_hour is not null
             """

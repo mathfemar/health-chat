@@ -968,6 +968,60 @@ async def generate_report_chart(ctx: dict, days: int = 7, title: str | None = No
 
 
 # --------------------------------------------------------------
+# get_bot_capabilities: lista comandos diretos + recursos do bot
+# --------------------------------------------------------------
+@tool(
+    name="get_bot_capabilities",
+    description=(
+        "Lista TODOS os comandos diretos do bot (/comandos) e os recursos automáticos "
+        "(scheduler de lembrete, auto-recálculo, etc). Use quando o user perguntar "
+        "'tem comando X?', 'como faço Y?', 'consegue agendar Z?' ou similar. "
+        "Você tem um resumo no system prompt — só chame esta tool se precisar de mais detalhe."
+    ),
+    parameters={"type": "object", "properties": {}},
+)
+async def get_bot_capabilities_tool(ctx: dict) -> dict:
+    from agent.prompts import BOT_CAPABILITIES
+    return {
+        "capabilities": BOT_CAPABILITIES,
+        "note": "Use estas informações pra responder ao usuário com precisão."
+    }
+
+
+# --------------------------------------------------------------
+# save_food_alias: ensina o matcher quando user aceita um substituto
+# --------------------------------------------------------------
+@tool(
+    name="save_food_alias",
+    description=(
+        "Cria um alias permanente: quando 'unknown_name' aparecer no futuro, "
+        "use direto o food_id (sem buscar). Use quando o usuário aceitou um "
+        "SUBSTITUTO pra um alimento que nenhuma fonte tem. Ex: bolo de carne → "
+        "carne moída cozida. Da próxima vez, search_foods('bolo de carne') retorna direto."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "unknown_name": {"type": "string", "description": "Nome que o usuário usou. Ex: 'bolo de carne'"},
+            "food_id": {"type": "integer", "description": "ID do alimento na tabela foods"},
+        },
+        "required": ["unknown_name", "food_id"],
+    },
+)
+async def save_food_alias_tool(ctx: dict, unknown_name: str, food_id: int) -> dict:
+    food = await db.get_food(food_id)
+    if not food:
+        return {"error": f"food_id {food_id} não existe"}
+    await matcher.save_alias(unknown_name, food_id, user_id=ctx["user_id"])
+    return {
+        "ok": True,
+        "alias_saved": unknown_name,
+        "mapped_to": food["name"],
+        "note": "Próxima busca por '{}' vai retornar este alimento direto.".format(unknown_name),
+    }
+
+
+# --------------------------------------------------------------
 # 11. remember (scratchpad da conversa atual)
 # --------------------------------------------------------------
 @tool(

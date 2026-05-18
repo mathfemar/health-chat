@@ -126,6 +126,7 @@ create table user_profiles (
     -- Lembrete de pesagem
     weigh_in_enabled  boolean default true,
     weigh_in_hour     int default 6,                       -- hora local (0-23)
+    weigh_in_minute   int default 0,                       -- minuto (0-59)
     weigh_in_tz       text default 'America/Sao_Paulo',
     weigh_in_last_date date,                               -- última vez que enviamos hoje
     updated_at        timestamptz default now()
