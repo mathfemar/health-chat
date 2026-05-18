@@ -428,11 +428,16 @@ async def get_recent_meals(ctx: dict, days: int = 7) -> dict:
 # 10. get_user_profile
 # --------------------------------------------------------------
 _ONBOARDING_ORDER = [
-    "sex", "birth_date", "height_cm", "current_weight_kg",
+    "timezone", "sex", "birth_date", "height_cm", "current_weight_kg",
     "target_weight_kg", "activity_level", "weekly_rate_kg", "eatback_pct",
 ]
 
 _QUESTION_TEMPLATES = {
+    "timezone": (
+        "Onde você mora? Pode ser cidade/estado/país. "
+        "Vou usar isso pra horários e lembretes ficarem certos.\n"
+        "Ex: 'Rio de Janeiro', 'São Paulo', 'Acre', 'Manaus', 'Lisboa'."
+    ),
     "sex": "Qual seu sexo biológico? Responda M (masculino), F (feminino) ou O (outro).",
     "birth_date": "Qual sua data de nascimento? Formato YYYY-MM-DD (ex: 1995-03-21).",
     "height_cm": "Qual sua altura em cm? (ex: 178)",
@@ -488,6 +493,7 @@ async def get_user_profile(ctx: dict) -> dict:
     return {
         "exists": True,
         "name": p.get("name"),
+        "timezone": p.get("timezone") or "America/Sao_Paulo",
         "sex": p.get("sex"),
         "birth_date": str(p["birth_date"]) if p.get("birth_date") else None,
         "height_cm": p.get("height_cm"),

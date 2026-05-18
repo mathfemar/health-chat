@@ -123,6 +123,8 @@ create table user_profiles (
     daily_kcal        int,                     -- calculado e cacheado
     daily_protein_g   int,                     -- calculado e cacheado
     preferences       text,
+    -- Timezone IANA pra TUDO (display, day boundaries, reminder)
+    timezone          text default 'America/Sao_Paulo',
     -- Lembrete de pesagem
     weigh_in_enabled  boolean default true,
     weigh_in_hour     int default 6,                       -- hora local (0-23)
