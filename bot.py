@@ -773,19 +773,21 @@ async def _weigh_in_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             log.exception("falha enviando lembrete telegram user_id=%s", u.get("user_id"))
 
-        # WhatsApp: se este user_id está vinculado a um número, manda lá também.
-        # (single-user por enquanto: WHATSAPP_LINK_PHONE ↔ ALLOWED_USER_ID)
-        wa_phone = os.environ.get("WHATSAPP_LINK_PHONE")
+        # WhatsApp: se este user_id está vinculado a um (ou mais) números, manda lá também.
+        # (single-user: WHATSAPP_LINK_PHONE comma-sep ↔ ALLOWED_USER_ID)
+        wa_phones_raw = os.environ.get("WHATSAPP_LINK_PHONE", "")
         allowed = os.environ.get("ALLOWED_USER_ID")
-        if (wa_phone and allowed and str(u["user_id"]) == allowed
+        wa_phones = [p.strip() for p in wa_phones_raw.split(",") if p.strip()]
+        if (wa_phones and allowed and str(u["user_id"]) == allowed
                 and os.environ.get("TWILIO_ACCOUNT_SID")):
-            try:
-                from whatsapp import send_whatsapp_message
-                await send_whatsapp_message(wa_phone, body=reminder_text)
-                sent_any = True
-                log.info("lembrete whatsapp enviado pra %s", wa_phone)
-            except Exception:
-                log.exception("falha enviando lembrete whatsapp")
+            from whatsapp import send_whatsapp_message
+            for phone in wa_phones:
+                try:
+                    await send_whatsapp_message(phone, body=reminder_text)
+                    sent_any = True
+                    log.info("lembrete whatsapp enviado pra %s", phone)
+                except Exception:
+                    log.exception("falha enviando lembrete whatsapp pra %s", phone)
 
         if not sent_any:
             continue

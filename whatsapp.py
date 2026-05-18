@@ -37,6 +37,13 @@ from twilio.request_validator import RequestValidator
 
 load_dotenv()
 
+# Configura logging do app (uvicorn standalone não chama basicConfig do nosso código).
+# Se bot.py já configurou (modo integrado), basicConfig é no-op.
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+)
+
 import db
 from agent import runtime as agent
 
@@ -69,14 +76,20 @@ def _phone_normalize(p: str) -> str:
     return p
 
 
+def _allowed_phones() -> set[str]:
+    """Lista normalizada de telefones autorizados (WHATSAPP_LINK_PHONE,
+    aceita lista separada por vírgula pra suportar múltiplos números de teste)."""
+    raw = os.environ.get("WHATSAPP_LINK_PHONE", "")
+    return {_phone_normalize(p) for p in raw.split(",") if p.strip()}
+
+
 def _resolve_user_id(from_phone: str) -> int | None:
-    """Mapeia phone → user_id. Single-user: só aceita WHATSAPP_LINK_PHONE
-    e mapeia pro ALLOWED_USER_ID."""
-    link = os.environ.get("WHATSAPP_LINK_PHONE")
+    """Mapeia phone → user_id. Single-user: qualquer um dos telefones em
+    WHATSAPP_LINK_PHONE (comma-sep) mapeia pro ALLOWED_USER_ID."""
     allowed = os.environ.get("ALLOWED_USER_ID")
-    if not link or not allowed:
+    if not allowed:
         return None
-    if _phone_normalize(from_phone) == _phone_normalize(link):
+    if _phone_normalize(from_phone) in _allowed_phones():
         try:
             return int(allowed)
         except ValueError:
@@ -267,7 +280,12 @@ async def twilio_webhook(request: Request) -> PlainTextResponse:
 
     user_id = _resolve_user_id(from_phone)
     if user_id is None:
-        log.info("mensagem de phone não autorizado: %s", from_phone)
+        if not os.environ.get("ALLOWED_USER_ID"):
+            log.warning("ALLOWED_USER_ID vazio no .env — não consigo mapear nenhum telefone")
+        elif _phone_normalize(from_phone) not in _allowed_phones():
+            log.info("telefone %s não está em WHATSAPP_LINK_PHONE — ignorando", from_phone)
+        else:
+            log.warning("ALLOWED_USER_ID=%r não é int válido", os.environ.get("ALLOWED_USER_ID"))
         # responde TwiML vazio — silenciosamente ignora
         return PlainTextResponse(
             '<?xml version="1.0" encoding="UTF-8"?><Response/>',
