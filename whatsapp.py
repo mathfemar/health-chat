@@ -44,6 +44,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
+import commands
 import db
 from agent import runtime as agent
 
@@ -309,6 +310,48 @@ async def twilio_webhook(request: Request) -> PlainTextResponse:
     )
 
 
+async def _send_command_result(from_phone: str, r: commands.CommandResult) -> None:
+    """Envia CommandResult pro WhatsApp: texto (convertendo HTML→WA) + foto (via stash_media)."""
+    if r.text:
+        await send_whatsapp_message(from_phone, body=tg_html_to_whatsapp(r.text))
+    if r.png:
+        try:
+            url = stash_media(r.png, "image/png")
+            await send_whatsapp_message(from_phone, media_url=url)
+        except RuntimeError as e:
+            log.warning("não consegui mandar imagem do comando: %s", e)
+            await send_whatsapp_message(
+                from_phone,
+                body="(imagem gerada, mas PUBLIC_BASE_URL não configurado pra entregar via WhatsApp)",
+            )
+
+
+async def _try_handle_slash_command(
+    user_id: int, from_phone: str, body: str
+) -> bool:
+    """Se body for um '/comando', executa via commands.py e responde.
+    Retorna True se foi um comando (mesmo desconhecido); False pra texto livre."""
+    parsed = commands.parse_slash(body)
+    if not parsed:
+        return False
+    cmd, args = parsed
+    handler = commands.COMMAND_HANDLERS.get(cmd)
+    if not handler:
+        await send_whatsapp_message(
+            from_phone,
+            body=f"Comando /{cmd} não reconhecido. Manda /ajuda pra ver a lista.",
+        )
+        return True
+    try:
+        log.info("twilio cmd: /%s args=%s user_id=%s", cmd, args, user_id)
+        result = await handler(user_id, args)
+        await _send_command_result(from_phone, result)
+    except Exception as e:
+        log.exception("erro executando /%s", cmd)
+        await send_whatsapp_message(from_phone, body=f"Erro em /{cmd}: {e}")
+    return True
+
+
 async def _process_message(
     user_id: int,
     from_phone: str,
@@ -316,8 +359,12 @@ async def _process_message(
     media_url: str | None,
     media_type: str | None,
 ) -> None:
-    """Executa o agente e responde via REST API."""
+    """Executa comando slash OU o agente e responde via REST API."""
     try:
+        # Slash command? (só faz sentido sem mídia anexada — foto sempre vai pro agente)
+        if not media_url and await _try_handle_slash_command(user_id, from_phone, body):
+            return
+
         # Photo handling: usamos o próprio URL como photo_ref. O agente passa
         # esse ref de volta pro download_photo callable, que baixa via basic auth.
         photo_ref: str | None = None
