@@ -118,7 +118,7 @@ async def _post_openrouter(payload: dict) -> dict:
 
 
 async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
-                   bot, vision_model: str) -> str:
+                   download_photo, vision_model: str) -> str:
     """Executa um turno completo. Retorna o texto pra mandar ao usuário."""
     conv = await get_or_create_conversation(user_id)
     conv_id = conv["id"]
@@ -140,7 +140,7 @@ async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
     ctx = {
         "user_id": user_id,
         "conv_id": conv_id,
-        "bot": bot,
+        "download_photo": download_photo,
         "vision_model": vision_model,
         # Foto desta msg (ou da última, recuperada do DB se nesta não veio)
         "latest_photo_id": photo_file_id or await _last_photo_id(conv_id),
