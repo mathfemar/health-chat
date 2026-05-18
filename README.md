@@ -169,12 +169,69 @@ notepad .env       # preenche os campos abaixo
 
 # Cria schema + popula 590 alimentos do TACO
 python import_taco.py
+```
 
-# Sobe o bot
+---
+
+## Como rodar
+
+Você tem **3 modos** de execução. Use o que se encaixar no que você quer testar.
+
+### Modo 1 — Só Telegram (mais simples)
+
+```powershell
 python bot.py
 ```
 
-No Telegram, manda `/start` pro seu bot e depois `"quero definir minha meta"` pra começar o onboarding conversacional.
+Requer `TELEGRAM_BOT_TOKEN` no `.env`. Se as envs do Twilio estiverem **vazias**, o adapter WhatsApp não sobe e o bot roda só no Telegram.
+
+No Telegram, manda `/start` pro seu bot e depois `"quero definir minha meta"` pra começar o onboarding.
+
+### Modo 2 — Só WhatsApp (standalone)
+
+Útil pra testar o WhatsApp isoladamente, ou rodar sem precisar de bot Telegram.
+
+```powershell
+python -m uvicorn whatsapp:app --host 0.0.0.0 --port 8000
+```
+
+Requer as 5 envs do Twilio no `.env` (ver seção [WhatsApp (Twilio)](#whatsapp-twilio--opcional-roda-em-paralelo-ao-telegram) abaixo). Não precisa de `TELEGRAM_BOT_TOKEN`.
+
+> **Dica de debug**: pra subir o servidor antes de ter o túnel pronto, põe `TWILIO_VALIDATE=0` no `.env` (desabilita validação de assinatura). Depois muda pra `1`.
+
+### Modo 3 — Telegram + WhatsApp juntos (produção)
+
+```powershell
+python bot.py
+```
+
+Quando as envs do Twilio estão **preenchidas**, o `bot.py` sobe automaticamente também o servidor FastAPI do WhatsApp em paralelo (mesma process). Os dois canais compartilham banco/histórico/perfil.
+
+Você vai ver nos logs:
+```
+Telegram polling iniciado.
+WhatsApp adapter iniciando em 0.0.0.0:8000
+```
+
+### Pré-requisito comum: túnel pra Twilio (modos 2 e 3)
+
+Twilio precisa alcançar seu PC via URL pública. Em **outra janela do PowerShell**:
+
+```powershell
+# Instala (uma vez só)
+winget install --id Cloudflare.cloudflared
+
+# Sobe o túnel apontando pra porta 8000
+cloudflared tunnel --url http://localhost:8000
+```
+
+Copia a URL `https://xxx-yyy.trycloudflare.com` que aparecer, cola em `PUBLIC_BASE_URL` no `.env`, e no Twilio Console (**Messaging → Sandbox Settings → When a message comes in**) cola `<URL>/twilio/webhook` POST.
+
+> A URL muda toda vez que você reinicia o `cloudflared`. Pra rodar 24/7, criar um [túnel nomeado](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) (grátis, URL fixa).
+
+### Parando o bot
+
+`Ctrl+C` na janela do bot/uvicorn. O cloudflared é separado, também `Ctrl+C` na janela dele.
 
 ---
 
