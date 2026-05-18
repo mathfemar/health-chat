@@ -608,14 +608,22 @@ async def _weigh_in_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             log.exception("falha enviando lembrete telegram user_id=%s", u.get("user_id"))
 
         # WhatsApp: se este user_id está vinculado a um (ou mais) números, manda lá também.
-        # (single-user: WHATSAPP_LINK_PHONE comma-sep ↔ ALLOWED_USER_ID)
+        # 3 cenários:
+        # - ALLOWED_USER_ID definido: só manda se user_id bater (single-user).
+        # - ALLOWED_USER_ID vazio: tenta casar via phone-derived id (multi-user).
+        # - WHATSAPP_LINK_PHONE vazio: pula (não sabemos pra qual phone mandar).
         wa_phones_raw = os.environ.get("WHATSAPP_LINK_PHONE", "")
         allowed = os.environ.get("ALLOWED_USER_ID")
         wa_phones = [p.strip() for p in wa_phones_raw.split(",") if p.strip()]
-        if (wa_phones and allowed and str(u["user_id"]) == allowed
-                and os.environ.get("TWILIO_ACCOUNT_SID")):
-            from whatsapp import send_whatsapp_message
-            for phone in wa_phones:
+        if wa_phones and os.environ.get("TWILIO_ACCOUNT_SID"):
+            from whatsapp import send_whatsapp_message, _phone_to_user_id
+            # Decide se este user_id corresponde a algum dos telefones configurados
+            if allowed:
+                target_phones = wa_phones if str(u["user_id"]) == allowed else []
+            else:
+                target_phones = [p for p in wa_phones
+                                 if _phone_to_user_id(p) == u["user_id"]]
+            for phone in target_phones:
                 try:
                     await send_whatsapp_message(phone, body=reminder_text)
                     sent_any = True

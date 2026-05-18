@@ -79,23 +79,38 @@ def _phone_normalize(p: str) -> str:
 
 def _allowed_phones() -> set[str]:
     """Lista normalizada de telefones autorizados (WHATSAPP_LINK_PHONE,
-    aceita lista separada por vírgula pra suportar múltiplos números de teste)."""
+    aceita lista separada por vírgula). Vazio = qualquer telefone permitido."""
     raw = os.environ.get("WHATSAPP_LINK_PHONE", "")
     return {_phone_normalize(p) for p in raw.split(",") if p.strip()}
 
 
+def _phone_to_user_id(phone: str) -> int:
+    """Deriva user_id estável a partir do número de telefone (só dígitos).
+    Ex: '+5521985857972' → 5521985857972. Cada phone = id único."""
+    digits = "".join(c for c in _phone_normalize(phone) if c.isdigit())
+    return int(digits) if digits else 0
+
+
 def _resolve_user_id(from_phone: str) -> int | None:
-    """Mapeia phone → user_id. Single-user: qualquer um dos telefones em
-    WHATSAPP_LINK_PHONE (comma-sep) mapeia pro ALLOWED_USER_ID."""
-    allowed = os.environ.get("ALLOWED_USER_ID")
-    if not allowed:
+    """Mapeia phone → user_id.
+
+    Política:
+    1. Se WHATSAPP_LINK_PHONE definido e o phone NÃO está na lista → rejeita.
+    2. Se ALLOWED_USER_ID definido → usa ele (single-user: vários phones
+       compartilham o mesmo histórico/perfil do Telegram).
+    3. Caso contrário → deriva user_id dos dígitos do phone (multi-user
+       implícito, cada número tem sua própria conta).
+    """
+    allowed_phones = _allowed_phones()
+    if allowed_phones and _phone_normalize(from_phone) not in allowed_phones:
         return None
-    if _phone_normalize(from_phone) in _allowed_phones():
+    fixed = os.environ.get("ALLOWED_USER_ID")
+    if fixed:
         try:
-            return int(allowed)
+            return int(fixed)
         except ValueError:
-            return None
-    return None
+            log.warning("ALLOWED_USER_ID=%r não é int válido — usando phone-derived", fixed)
+    return _phone_to_user_id(from_phone)
 
 
 # ============================================================
@@ -281,12 +296,7 @@ async def twilio_webhook(request: Request) -> PlainTextResponse:
 
     user_id = _resolve_user_id(from_phone)
     if user_id is None:
-        if not os.environ.get("ALLOWED_USER_ID"):
-            log.warning("ALLOWED_USER_ID vazio no .env — não consigo mapear nenhum telefone")
-        elif _phone_normalize(from_phone) not in _allowed_phones():
-            log.info("telefone %s não está em WHATSAPP_LINK_PHONE — ignorando", from_phone)
-        else:
-            log.warning("ALLOWED_USER_ID=%r não é int válido", os.environ.get("ALLOWED_USER_ID"))
+        log.info("telefone %s não está em WHATSAPP_LINK_PHONE — ignorando", from_phone)
         # responde TwiML vazio — silenciosamente ignora
         return PlainTextResponse(
             '<?xml version="1.0" encoding="UTF-8"?><Response/>',
