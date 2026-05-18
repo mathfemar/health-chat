@@ -1,77 +1,128 @@
 # health-chat
 
-Bot de Telegram que analisa fotos de refeições e estima macros + calorias usando uma base nutricional real (TACO) em vez de só "chutômetro" da LLM.
+Bot de Telegram conversacional pra registrar **alimentação + exercício + peso** com base nutricional brasileira real (TACO + Vitat) — em vez de só "chutômetro" de LLM.
 
-> **Por que existe**: aplicativos como MyFitnessPal/FatSecret têm churn alto porque exigem abrir outro app. Aqui, o registro acontece dentro do messenger que você já usa o dia inteiro. Manda foto → resposta em ~5 segundos → corrige se quiser → soma no seu diário.
+> **Por que existe**: MyFitnessPal/Cal AI/Lifesum têm churn alto porque exigem abrir um app à parte e digitar tudo. Aqui o registro acontece dentro do messenger que você já abre o dia inteiro. **Foto, texto ou áudio → bot resolve → diário atualizado, gráfico bonito, meta recalculada.**
 
 ---
 
-## Diferencial vs. apps de foto + LLM
+## Diferenciais
 
-Os apps comerciais (Cal AI, Bites.ai, etc.) jogam a foto inteira numa LLM e pedem macros já calculados. Resultado: números falsamente precisos baseados na memória paramétrica do modelo, que erra feio em porção e em alimentos brasileiros.
+| | Cal AI / MFP / Lifesum | health-chat |
+|---|---|---|
+| Onde roda | App próprio (mais um app pra abrir) | **Dentro do Telegram** |
+| Base nutricional | Caixa-preta ou genérica USA | **TACO (UNICAMP) + Vitat brasileira** |
+| Foto de prato | LLM chuta macros (erro ~30%) | LLM **identifica**, banco **calcula** |
+| Foto de cardápio | Não existe | **Sim** — parseia + ranqueia por meta |
+| Foto de relógio fitness | Não existe | **Sim** — extrai treino do Apple Watch / Garmin / Strava |
+| Foto de balança | Não existe | **Sim** — lê peso, recalcula meta |
+| Aprendizado | Não aprende | Cada correção vira **alias permanente** |
+| Custo/mês | R\$ 35-50 | **~R\$ 0,50** (~$0,10) |
 
-Aqui o pipeline é diferente:
+---
 
-1. **Vision LLM identifica** os alimentos visíveis (nome simples, em pt-BR) e estima a porção em gramas.
-2. **Matcher** (Python + Postgres) procura cada alimento na **Tabela TACO** (UNICAMP, 597 alimentos).
-3. **Calculator** multiplica `porção × macros por 100g` da TACO → números reais, auditáveis, com fonte.
-4. Quando o matcher erra, **você corrige com um botão** e o bot aprende (`food_aliases`) — da próxima vez vai direto sem perguntar.
+## Funcionalidades
 
-Resultado: você ganha precisão de tabela oficial + flexibilidade da LLM pra ler a foto.
+### Conversação com agente (Gemma 4 31B ou DeepSeek V4 via OpenRouter)
+- Mensagem livre → agente decide quais **tools** chamar
+- Foto → identifica se é prato, cardápio, relógio ou balança e roteia
+- Histórico de conversa persistido em Postgres (20 últimas msgs em janela)
+- Tool calling nativo (não ReAct — usa o protocolo OpenAI)
+
+### Comida
+- **Vision LLM identifica** alimentos + porção em gramas (e medida caseira quando aplicável)
+- **Matcher em cascata**: alias aprendido → pg_trgm local → LLM rerank (Gemma free)
+- **Base nutricional**: TACO 4ª ed. (597 alimentos brasileiros) + cache crescente da Vitat
+- **Vitat on-demand**: quando TACO não tem (estrogonofe, sushi, marcas, etc), busca no [vitat.com.br](https://vitat.com.br), cacheia local em `foods (source='VITAT')` — chamada online só uma vez por alimento
+
+### Exercício
+- **Foto do relógio** (Apple Watch, Garmin, Strava, Polar, Whoop): extrai atividade, duração, kcal queimadas, distância, BPM médio
+- **Manual via texto**: "fiz 1h de corrida, 580 kcal"
+- **Tabela `exercises`** com fonte (`watch_photo` | `manual` | `agent`)
+
+### Peso e metas
+- **Mifflin-St Jeor + fatores de atividade NEAT** (conservadores, sem inflar como MFP)
+- **Auto-recálculo** da meta toda vez que `log_weight` for chamado
+- **Foto da balança** → extrai número → loga + recalcula meta
+- **Lembrete diário de pesagem** via JobQueue (default 6h, configurável)
+- **Histórico de peso** com gráfico de média móvel 7d + linha da meta
+- **Eat-back configurável** (100% MFP / 50% Noom / 0% ignora)
+
+### Visualização
+- **Gráfico diário** (matplotlib): anel de kcal + barras de macros + breakdown por refeição — auto-anexado após `log_meal` e via `/grafico`
+- **Gráfico semanal/mensal**: intake vs queimado vs meta por dia
+- **Gráfico de peso**: pontos diários + MM 7d + meta horizontal
 
 ---
 
 ## Arquitetura
 
 ```
-┌────────────┐
-│   foto     │
-│ (Telegram) │
-└─────┬──────┘
-      │
-      ▼
-┌──────────────────────────────────┐
-│  Vision LLM (Gemini via OR)     │  ← prompt: identifica items + porção em g
-│  Output: [{name, portion_g, …}] │     decompõe pratos compostos
-└─────┬────────────────────────────┘
-      │
-      ▼
-┌──────────────────────────────────┐
-│  Matcher (cascata)              │
-│  1. food_aliases (aprendido)     │  ← exact match após normalizar
-│  2. pg_trgm + similaridade       │  ← Postgres trigram, score 0-1
-│  3. LLM rerank (Gemma 4 31B)      │  ← só se trigram for ambíguo
-└─────┬────────────────────────────┘
-      │
-      ▼
-┌──────────────────────────────────┐
-│  Calculator                     │
-│  portion_g / 100 × per_100g_*   │
-└─────┬────────────────────────────┘
-      │
-      ▼
-┌──────────────────────────────────┐
-│  Resposta no Telegram           │
-│  ✅ TACO  🟡 estimativa  ❌ none │
-│  + botões: ✏️ trocar / 🗑 apagar  │
-└──────────────────────────────────┘
-                  │
-                  │ usuário corrige
-                  ▼
-            salva em food_aliases (aprende)
+mensagem do user (texto, foto, ou ambos)
+        │
+        ▼
+┌─────────────────────────────────────────────┐
+│            bot.py (Telegram)               │
+│  comandos diretos OU rota pro agente       │
+└─────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────┐
+│       agent/runtime.py — loop de tool      │
+│       calling com Gemma 4 31B              │
+│  • carrega últimas 20 msgs                 │
+│  • monta payload (system + tools schema)   │
+│  • executa tools que o modelo escolher     │
+│  • máx 8 tool calls/turno + wrap-up        │
+└─────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────┐
+│     agent/tools.py — 24 tools              │
+│  • search_foods, search_vitat,             │
+│    fetch_vitat_food, get_food_portions     │
+│  • estimate_meal_from_photo, parse_menu,   │
+│    parse_watch_photo, parse_scale_photo    │
+│  • log_meal, log_exercise, log_weight      │
+│  • set_profile, compute_daily_goal,        │
+│    compare_to_goal                         │
+│  • get_today_summary, get_recent_meals,    │
+│    get_calorie_balance, get_period_summary │
+│  • generate_daily_chart,                   │
+│    generate_weight_chart,                  │
+│    generate_report_chart                   │
+│  • remember (scratchpad da conversa)       │
+└─────────────────────────────────────────────┘
+        │            │              │
+        ▼            ▼              ▼
+   matcher.py    calculator.py   sources/vitat.py
+   (cascata     (portion × per_  (busca online,
+   pg_trgm)     100g macros)     bug ×100 fix)
+        │            │              │
+        └────────────┼──────────────┘
+                     ▼
+            Postgres (Supabase):
+            foods | food_portions | food_aliases
+            meals | exercises | weight_log
+            conversations | messages | user_profiles
 ```
 
 ---
 
 ## Stack
 
-| Componente | Tecnologia |
+| Camada | Tecnologia |
 |---|---|
-| Bot | [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) 21.x |
-| LLM | OpenRouter (Gemini 3 Flash pra visão, Gemma 4 31B pra rerank) |
+| Bot Telegram | [python-telegram-bot 21.x](https://github.com/python-telegram-bot/python-telegram-bot) (com `[ext]` pra JobQueue) |
+| HTTP | httpx async |
+| Vision LLM | Gemini 3 Flash Preview via OpenRouter (configurável) |
+| Chat LLM (agente) | Gemma 4 31B ou DeepSeek V4 Flash via OpenRouter (configurável) |
+| Rerank LLM | Gemma 4 31B ou outro free |
 | Banco | Postgres no Supabase (free tier) |
-| Matching | `pg_trgm` (similaridade de trigramas) |
-| Base nutricional | TACO 4ª ed. — NEPA/UNICAMP, 597 alimentos |
+| Matching textual | `pg_trgm` (similaridade de trigramas) |
+| Cálculos | `goals.py` (Mifflin-St Jeor, deterministico) |
+| Gráficos | matplotlib (Agg, sem GUI) |
+| Base nutricional | TACO 4ª ed. (NEPA/UNICAMP) + Vitat on-demand |
 
 ---
 
@@ -79,97 +130,51 @@ Resultado: você ganha precisão de tabela oficial + flexibilidade da LLM pra le
 
 ### Pré-requisitos
 - Python 3.11+ (testado em 3.13)
-- Conta no [Telegram](https://t.me/BotFather) (pra criar o bot)
-- Conta no [Supabase](https://supabase.com) (free tier basta)
-- Conta no [OpenRouter](https://openrouter.ai) (com $1-2 de crédito ou key free)
+- Conta no [Telegram](https://t.me/BotFather)
+- Conta no [Supabase](https://supabase.com) (free tier)
+- Conta no [OpenRouter](https://openrouter.ai) (com $2-5 de crédito)
 
 ### 1. Bot do Telegram
-1. Abre o [@BotFather](https://t.me/BotFather)
+1. Abre [@BotFather](https://t.me/BotFather)
 2. `/newbot` → segue as instruções → guarda o **token**
-3. Manda `/setdescription` pra dar uma descrição
-4. (Opcional) `/setuserpic` pra colocar imagem
+3. (Opcional) `/setdescription` e `/setuserpic`
 
 ### 2. Supabase
-1. Cria um projeto novo em [supabase.com](https://supabase.com)
+1. Cria projeto novo em [supabase.com](https://supabase.com)
 2. Escolhe região **South America (São Paulo)**
 3. **Anota a senha do Postgres** (só aparece uma vez)
-4. Quando subir: botão verde **Connect** (canto superior direito)
-5. Aba **Connection string** → **URI** → modo **Transaction pooler** (porta 6543) OU **Direct connection** (porta 5432)
+4. Botão verde **Connect** (canto superior direito)
+5. Aba **Connection string** → **URI** → modo **Transaction pooler** (porta 6543) OU **Direct connection** (5432)
 6. Substitui `[YOUR-PASSWORD]` pela senha do passo 3
 
 ### 3. OpenRouter
 1. Cria conta em [openrouter.ai](https://openrouter.ai)
 2. **Settings → Privacy**: habilita "Enable training and logging" (alguns modelos free exigem)
 3. **Keys**: gera uma nova → guarda
-4. **Credits**: adiciona $1-2 se for usar modelos pagos (Gemini Flash custa ~$0.003/foto)
+4. **Credits**: adiciona $2-5 (Gemini Flash custa ~$0.003/foto; agente ~$0.002/turno)
 
 ### 4. Código
 
 ```powershell
-# Clone / cd na pasta
-git clone <repo> health-chat
+git clone https://github.com/mathfemar/health-chat.git
 cd health-chat
 
-# Venv + deps
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 
 # Configura
-cp .env.example .env       # ou copy no Windows
-notepad .env               # preenche TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY, DATABASE_URL
-                           # ALLOWED_USER_ID pode ficar vazio (qualquer um pode usar)
+copy .env.example .env
+notepad .env       # preenche os campos abaixo
 
-# Importa base TACO (cria schema + popula 590 alimentos)
+# Cria schema + popula 590 alimentos do TACO
 python import_taco.py
-# Deve imprimir: "OK. Inseridos/atualizados: 590. Total no banco: 590."
 
 # Sobe o bot
 python bot.py
-# Deve imprimir: "Bot rodando."
-
-# No Telegram, manda /start pro seu bot
 ```
 
----
-
-## Comandos do bot
-
-| Comando | O que faz |
-|---|---|
-| `/start` | Boas-vindas, mostra seu `user_id` |
-| `/ajuda` | Lista de comandos |
-| `/hoje` | Refeições e total do dia |
-| `/semana` | Total e média dos últimos 7 dias |
-| `/apagar` | Remove a última refeição |
-| `/modelo [slug]` | Vê ou troca o modelo de visão em runtime (sem reiniciar). Ex: `/modelo openai/gpt-4o` |
-| `/buscar <termo>` | Busca direta no banco TACO. Útil pra ver o que o matcher acharia antes de tirar foto |
-
-**Foto**: manda qualquer foto de comida. Em 3-8s o bot responde com breakdown + botões.
-
-**Botões inline na resposta:**
-- `✏️ trocar #N <item>` — abre as alternativas do TACO pra você escolher a correta. A escolha vira **alias permanente** — da próxima vez, o bot vai direto.
-- `🗑 apagar refeição` — remove do diário.
-
----
-
-## Estrutura de arquivos
-
-```
-health-chat/
-├── bot.py                # Handlers do Telegram (commands, photo, callbacks)
-├── llm.py                # Chamadas OpenRouter: identify_items() + rerank()
-├── matcher.py            # Cascata alias → pg_trgm → LLM rerank
-├── calculator.py         # Combina items LLM + matches → calcula totals
-├── db.py                 # Pool asyncpg + helpers
-├── schema.sql            # Schema Postgres (foods, food_aliases, meals)
-├── import_taco.py        # Importa data/taco.json → foods
-├── data/
-│   └── taco.json         # TACO 4ª ed. (mirror de github.com/marcelosanto/tabela_taco)
-├── requirements.txt
-├── .env                  # Não commitado
-└── README.md
-```
+No Telegram, manda `/start` pro seu bot e depois `"quero definir minha meta"` pra começar o onboarding conversacional.
 
 ---
 
@@ -177,126 +182,265 @@ health-chat/
 
 ```env
 # Telegram
-TELEGRAM_BOT_TOKEN=         # do BotFather
-ALLOWED_USER_ID=            # opcional: trava o bot pro seu user_id; vazio = qualquer um
+TELEGRAM_BOT_TOKEN=                        # do BotFather
+
+# Trava o bot pro seu user_id (vazio = qualquer um pode usar)
+ALLOWED_USER_ID=
 
 # OpenRouter
-OPENROUTER_API_KEY=         # de openrouter.ai/keys
-OPENROUTER_MODEL=google/gemini-2.5-flash             # vision LLM (configurável em runtime via /modelo)
-OPENROUTER_RERANK_MODEL=google/gemma-4-31b-it    # modelo barato pra desempate
+OPENROUTER_API_KEY=
+OPENROUTER_MODEL=google/gemini-3-flash-preview            # vision LLM
+OPENROUTER_CHAT_MODEL=google/gemma-4-31b-it               # agente conversacional
+OPENROUTER_RERANK_MODEL=google/gemma-2-9b-it:free         # desempate de matching (opcional)
 
 # Postgres (Supabase)
-DATABASE_URL=postgresql://...
+DATABASE_URL=postgresql://postgres.xxx:SENHA@aws-0-sa-east-1.pooler.supabase.com:6543/postgres
 ```
 
 ---
 
-## Como o matching funciona (cascata)
+## Comandos diretos
 
-Cada item identificado pela Vision LLM passa por uma cascata. O primeiro nível que resolver vence — os de baixo nem rodam.
+| Comando | O que faz |
+|---|---|
+| `/start` ou `/ajuda` | Mostra todos os comandos |
+| `/perfil` | Vê seu perfil completo + meta calórica |
+| `/hoje` | Refeições + totais do dia |
+| `/semana` | Total dos últimos 7 dias |
+| `/grafico` | **Gráfico bonito do dia** (anel kcal + macros + refeições) |
+| `/relatorio [semana\|mes\|N]` | Gráfico de intake vs queimado vs meta no período |
+| `/lembrete [off\|on\|0-23]` | Configura lembrete diário de pesagem (default 6h) |
+| `/buscar <termo>` | Busca alimento no banco local (TACO + Vitat cacheado) |
+| `/modelo [slug]` | Vê ou troca o modelo de visão em runtime |
+| `/apagar` | Remove a última refeição |
+| `/reset` | Começa nova conversa com o agente (zera histórico) |
 
-### 1. `food_aliases` (custo: 0)
-Lookup exato em uma tabela de aliases aprendidos. Se você já corrigiu "salmão na brasa" → "Peixe, salmão, grelhado" antes, esse mapeamento fica registrado e é usado direto.
+---
 
-### 2. `pg_trgm` + normalização (custo: 0)
-Similaridade de trigramas entre `name_normalized` (lower + sem acentos, feito no Python) do alimento e dos 597 nomes da TACO. Threshold de aceitação: 0.55. Se top-1 passa com folga (gap >= 0.08 pro top-2), aceita direto. Performance: ~10ms via índice GIN.
+## Conversação com o agente (exemplos)
 
-### 3. LLM rerank (custo: ~$0.0001)
-Quando os 5 melhores do trigram são ambíguos (ou top-1 < 0.55), o bot manda os candidatos + nome original pra um modelo barato (Gemma 4 31b por default) que escolhe o melhor match — ou retorna `null` se nenhum serve. Isso lida com casos tipo "salmão na brasa" (TACO tem "Peixe, salmão, fresco, grelhado" mas o trigram score fica baixo por causa da ordem das palavras).
-
-### Sem match
-Retorna marcador `❌ sem dados`. Pode ser corrigido com `✏️ trocar` se houver alternativas no top-5.
-
-### Fallback estimativa (`🟡`)
-Quando o item é processado/restaurante (sorvete industrial, refrigerante, marca específica), a Vision LLM marca `is_processed=true` e fornece os macros estimados direto — pula o matcher porque a TACO não vai ter essas entradas.
-
-### Thresholds (em `matcher.py`)
-```python
-TRGM_THRESHOLD = 0.35       # mínimo absoluto pra considerar candidato
-HIGH_CONF_THRESHOLD = 0.55  # acima disso, aceita sem rerank
-GAP_FOR_TIEBREAK = 0.08     # se top1 - top2 < isso, considera empate e rerank
+### Onboarding
+```
+você:  oi
+bot:   Olá! Vamos montar seu perfil. Qual seu sexo biológico?
+       Responda M / F / O.
+você:  M
+bot:   Qual sua data de nascimento? Formato YYYY-MM-DD.
+... (continua até 8 perguntas, depois calcula meta)
 ```
 
-Ajustável conforme uso real. Se você ver muito "🟡 estimativa" indevido, abaixa `HIGH_CONF_THRESHOLD`. Se muito match errado direto, sobe.
+### Logar refeição
+```
+você:  comi 100g de arroz, 150g de bolo de carne e 50g de purê de abóbora
+bot:   ✅ Refeição #12 logada: 510 kcal (28g proteína).
+       [gráfico do dia anexado]
+```
+
+### Foto de cardápio
+```
+você:  [foto do cardápio]  quero algo com carne, faltam 800 kcal
+bot:   Vi 4 opções com carne vermelha:
+       1. Picanha grelhada (~580 kcal, ~55g prot) ⭐ melhor pra você
+       2. Bife à parmegiana (~720 kcal)
+       3. Strogonoff (~640 kcal)
+       Qual escolheu?
+```
+
+### Foto do relógio (Apple Watch / Strava)
+```
+você:  [foto do treino]
+bot:   Identifiquei: corrida, 45min, 412 kcal queimadas, 7.2 km, FC média 154.
+       Loga?
+você:  sim
+bot:   ✅ Exercício registrado.
+```
+
+### Foto da balança
+```
+você:  [foto da balança]
+bot:   Vejo 101.4 kg. Confirma?
+você:  sim
+bot:   ✅ Peso 101.4 kg registrado. Nova meta calórica: 1852 kcal/dia (Δ -10).
+```
+
+### Texto livre
+```
+você:  101.8       # número solto = vai direto pra log_weight
+bot:   ✅ Peso 101.8 kg registrado. Nova meta: 1858 kcal/dia.
+
+você:  como tá meu dia?
+bot:   Você comeu 1420 kcal, queimou 380 no treino. Com eat-back 0%, ainda pode comer 432 kcal pra fechar a meta de 1852.
+```
 
 ---
 
-## Aprendizado (food_aliases)
+## Estrutura de arquivos
 
-Cada vez que você usa o botão `✏️ trocar`:
-1. Sua escolha vai pra `food_aliases (alias, food_id, user_id)`
-2. Próxima foto, se a Vision LLM disser o mesmo nome → match direto, sem cascata.
-
-Isso é o **moat** da abordagem: em 1-2 semanas de uso, o sistema fica calibrado pros pratos que **você** come.
+```
+health-chat/
+├── bot.py                     # Handlers Telegram + JobQueue (lembrete)
+├── llm.py                     # Chamadas OpenRouter: vision, menu, scale, watch, rerank
+├── matcher.py                 # Cascata alias → pg_trgm → LLM rerank
+├── calculator.py              # portion × per_100g; recalc com override
+├── db.py                      # Pool asyncpg + helpers
+├── goals.py                   # Mifflin-St Jeor + fatores NEAT
+├── schema.sql                 # 9 tabelas: foods, meals, exercises, conversations, etc.
+├── import_taco.py             # Carrega data/taco.json → foods (idempotente)
+├── agent/
+│   ├── prompts.py             # SYSTEM_PROMPT + prompts de visão (food/menu/watch/scale)
+│   ├── schemas.py             # TypedDicts (Food, Meal, Portion, etc)
+│   ├── registry.py            # @tool decorator + sanitização de args
+│   ├── tools.py               # 24 tools que o agente pode chamar
+│   ├── runtime.py             # Loop tool-calling + fallback inteligente
+│   └── charts.py              # matplotlib (daily_progress, weight_trend, period)
+├── sources/
+│   └── vitat.py               # Cliente Vitat (buildId + search + fetch, bug ×100 fix)
+├── data/
+│   └── taco.json              # TACO 4ª ed.
+├── tests/
+│   └── test_vitat.py          # E2E do cliente Vitat (10 termos)
+├── slides/                    # Apresentação Beamer (LaTeX)
+│   └── apresentacao.tex
+├── requirements.txt
+├── .env.example
+├── .env                       # não commitado
+└── README.md
+```
 
 ---
 
-## Custos
+## Como o matching de alimentos funciona
 
-Por foto enviada:
-- **Gemini 2.5 Flash** (visão): ~$0.003
-- **Gemma 2 9B free** (rerank, quando precisa): $0
-- **Telegram**: grátis
-- **Supabase free tier**: 500MB, 60 conexões simultâneas — suficiente pra **anos** de uso individual
-- **Total**: ~$0.10/mês pra uso típico (4 fotos/dia)
+Cada nome de alimento (vindo da Vision LLM ou do usuário) passa por uma cascata. Primeiro nível que resolver vence — os de baixo nem rodam.
 
-Pra zerar custo: usa `OPENROUTER_MODEL=google/gemini-2.5-flash:free` (rate-limit menor mas free). Ou outros modelos free com visão em [openrouter.ai/models?modality=text%2Bimage-%3Etext](https://openrouter.ai/models).
+### Nível 1: `food_aliases` (custo $0)
+Lookup exato em tabela de aliases aprendidos. Se você já corrigiu "salmão na brasa" → "Peixe, salmão, fresco, grelhado" antes, esse mapping fica registrado e é usado direto.
+
+### Nível 2: `pg_trgm` + normalização Python (custo $0)
+Similaridade de trigramas entre `name_normalized` (lower + sem acentos) do alimento e dos ~600 nomes da TACO + Vitat cacheado.
+- Threshold de aceitação: 0.55 com gap >= 0.08 pro 2º colocado
+- Performance: ~10ms via índice GIN
+- Mesmo com erro de digitação ou palavra extra, normalmente acerta
+
+### Nível 3: `search_vitat` + `fetch_vitat_food` (custo $0 — só latência)
+Se o local não bate (score < 0.3), agente busca online no Vitat. Pega o melhor hit, baixa detalhes, salva em `foods (source='VITAT')`. **Próxima vez, cai no Nível 2 direto** — Vitat é chamada uma vez por alimento.
+
+### Nível 4: LLM rerank (custo ~$0.0001)
+Quando trigrama é ambíguo (ex: "strogonoff de frango" não tem match óbvio), agente passa top-5 candidatos pra um modelo barato (Gemma) que escolhe — ou diz "nenhum representa".
+
+### Fallback: estimativa LLM (marcador 🟡)
+Industrializados/restaurantes que nem Vitat tem: a Vision LLM marca `is_processed=true` e fornece macros estimados. Calculator usa esses números, marca o item como 🟡.
+
+---
+
+## Cálculo de meta (Mifflin-St Jeor com fatores NEAT)
+
+### BMR (Mifflin-St Jeor, 1990)
+```
+BMR (M) = 10×peso + 6,25×altura − 5×idade + 5
+BMR (F) = 10×peso + 6,25×altura − 5×idade − 161
+```
+Padrão clínico moderno, ±5% de erro contra calorimetria indireta. Referência: [Mifflin et al, AJCN 1990](https://pubmed.ncbi.nlm.nih.gov/2305711/).
+
+### Fatores de atividade — APENAS NEAT (sem treino)
+```
+sedentary    1,20  — mesa o dia inteiro
+light        1,30  — anda no escritório/casa
+moderate     1,40  — trabalho com circulação (professor, garçom)
+active       1,50  — trabalho braçal (construção, entregador)
+very_active  1,65  — trabalho fisicamente muito demandante
+```
+
+**Importante**: estes fatores são conservadores comparados aos do MFP/Cal AI (que usa até 1,9). Os multiplicadores antigos vinham de pesquisa dos anos 90 que superestima NEAT. A literatura recente com água duplamente marcada confirma a faixa 1.2-1.65 pra adultos modernos sem treino estruturado.
+
+**Treino é registrado separadamente** via `log_exercise` e somado ao budget conforme o `eatback_pct` (100% MFP / 50% Noom / 0% ignora).
+
+### Meta diária
+```
+TDEE = BMR × fator_atividade
+déficit = ritmo_kg_sem × 7700 / 7      (negativo pra perder)
+meta = max(piso_seguro, TDEE + déficit)
+```
+Pisos: 1500 kcal (M) / 1200 kcal (F).
+
+### Macros sugeridos
+- **Proteína**: 1,6 g/kg corporal (faixa de preservação muscular)
+- **Carbo / Gordura**: split 50/50 do restante após proteína
+
+---
+
+## Custos típicos
+
+| Operação | Modelo | Custo |
+|---|---|---|
+| Foto de prato (Vision + matcher + log) | Gemini 3 Flash | ~$0,005 |
+| Turno conversacional simples | Gemma 4 31B | ~$0,002 |
+| Foto de cardápio + ranking | Gemini + 2-3 tools | ~$0,01 |
+| Foto de relógio + log | Gemini + 1 tool | ~$0,003 |
+| Foto de balança + log + recalc | Gemini + 2 tools | ~$0,003 |
+| /grafico (sem LLM) | matplotlib local | $0 |
+| Vitat search/fetch (rede) | – | $0 |
+
+**Uso típico (4 fotos + 5 chats / dia)**: ~$0,10/mês.
+**Free tier total**: dá pra rodar 100% grátis trocando pra modelos `:free` no `.env` (DeepSeek free, Gemma 2 free, Gemini 2.5 Flash free) — com rate limits menores.
 
 ---
 
 ## Roadmap
 
-### Curto prazo (next)
-- [ ] **Vitat como fonte on-demand**: quando matcher falhar, busca em `vitat.com.br` (que tem receitas prontas e produtos industrializados que TACO não tem), cacheia em `foods` com `source='VITAT'`. Cresce o banco organicamente sem scraping em massa.
-- [ ] **Ajuste de porção via botão**: `✏️ ajustar porção` que abre +/- 25g ou input livre.
-- [ ] **Refeições recorrentes** (`/repetir cafe`): salva templates e reusa sem chamar LLM.
-- [ ] **Timezone correto** (atualmente hardcoded BRT em [db.py:list_today](db.py)).
+### Curto prazo
+- [ ] Comparativo entre Vision LLMs side-by-side
+- [ ] Refeições recorrentes (`/repetir cafe`)
+- [ ] Botão de ajuste de porção pós-log
+- [ ] Multi-foto numa msg só (rótulo + prato)
 
 ### Médio prazo
-- [ ] **Comparativo entre modelos**: roda 2-3 Vision LLMs na mesma foto e mostra side-by-side pra você calibrar empiricamente qual prefere.
-- [ ] **TBCA via scraping próprio** (cobre industrializados + receitas) — bloqueado por licença CC BY-NC-ND se virar produto.
-- [ ] **Histórico/gráficos**: `/grafico semana` retorna PNG com tendência.
-- [ ] **Targets**: define meta (ex: 2200 kcal/dia, 150g proteína) e mostra delta no `/hoje`.
+- [ ] Voice messages (STT via Whisper)
+- [ ] Sugestões proativas ("ainda faltam 50g de proteína hoje")
+- [ ] Integração com HealthKit/Google Fit
+- [ ] TBCA via scraping pessoal
 
 ### Longo prazo
-- [ ] **Voice messages**: "tomei um café com leite e um pão de queijo" → STT → mesma cascata.
-- [ ] **Multi-user com Supabase Auth**.
+- [ ] Multi-user com auth (Supabase Auth)
+- [ ] Versão WhatsApp (mesma lógica, gateway diferente)
+- [ ] Dashboard web (Next.js consumindo os mesmos endpoints)
 
 ---
 
 ## Troubleshooting
 
 ### `ModuleNotFoundError: No module named 'dotenv'`
-Venv não está ativo, ou `pip install -r requirements.txt` não rodou. Reativa:
-```powershell
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
+Venv não ativado, ou `pip install -r requirements.txt` não rodou.
 
 ### `asyncpg.exceptions.DuplicatePreparedStatementError`
-Você está usando o pgbouncer (porta 6543) sem desabilitar prepared statements. O código já desabilita (`statement_cache_size=0`) — confere se [db.py](db.py) está atualizado.
+Pgbouncer (porta 6543) não aceita prepared statements. O código já desabilita (`statement_cache_size=0`) — confirma que [db.py](db.py) está atualizado.
 
-### `function unaccent(text) does not exist` / `gin_trgm_ops does not exist`
-Extensão pg_trgm não instalada ou search_path não inclui `extensions`. Confere que `db.py:_init_conn` está executando `set search_path to public, extensions`.
+### `function unaccent / gin_trgm_ops does not exist`
+Extensão pg_trgm não no search_path. Confere [db.py:_init_conn](db.py) executando `set search_path to public, extensions`.
 
-### Bot não responde no Telegram
-1. Confere que o terminal mostra `Bot rodando.`
-2. Confere que está mandando mensagem pro bot certo (username que você criou no BotFather)
-3. Se tiver `ALLOWED_USER_ID` configurado, confere que bate com seu user_id
-4. Reinicia o bot (`Ctrl+C` + `python bot.py`)
+### `OpenRouter 401 "User not found"`
+Key revogada/inválida. Vai em [openrouter.ai/keys](https://openrouter.ai/keys), gera nova, cola no `.env`.
 
-### `OpenRouter 403 Forbidden`
-- Modelo exige habilitar privacy/logging em [openrouter.ai/settings/privacy](https://openrouter.ai/settings/privacy)
-- Sem créditos pro modelo pago
-- Slug do modelo errado — confere em [openrouter.ai/models](https://openrouter.ai/models)
+### `OpenRouter 403`
+Modelo exige privacy/logging em [openrouter.ai/settings/privacy](https://openrouter.ai/settings/privacy), ou sem créditos, ou slug errado.
 
-### Telegram retorna `Can't parse entities`
-Algum caractere especial está quebrando o parser. O código usa HTML escape (`html.escape`) em todo conteúdo dinâmico, mas se aparecer de novo, é bug — abre issue com o stack trace.
+### Telegram `409 Conflict: terminated by other getUpdates`
+Outro processo do bot rodando com o mesmo token. Mata um.
+
+### Telegram `Can't parse entities`
+HTML mal-formado da LLM. O código sanitiza em `bot._md_to_html` + `_balance_html_tags`. Se acontecer, abre issue com o stack trace.
+
+### Agente alucinando nome / reinicia onboarding
+DeepSeek V4 Flash tem essa fraqueza. Troca pra Gemma 4 31B no `.env` (`OPENROUTER_CHAT_MODEL=google/gemma-4-31b-it`) e reinicia.
+
+### Vitat retornando 0 hits / `buildId` não extraído
+Vitat mudou layout. Confere [sources/vitat.py:BUILD_ID_PROBE_PATHS](sources/vitat.py) e roda `python tests/test_vitat.py` pra debugar.
 
 ---
 
 ## Licenças e fontes
 
 - **Código**: este repo é seu — escolhe a licença que quiser.
-- **TACO**: domínio quase-público; NEPA-UNICAMP exige citação ("NEPA-UNICAMP, TACO 4ª edição, 2011"). Uso pessoal/educacional OK. Comercial: confirma com a instituição.
-- **JSON mirror**: [github.com/marcelosanto/tabela_taco](https://github.com/marcelosanto/tabela_taco).
+- **TACO**: uso pessoal/educacional livre com citação ("NEPA-UNICAMP, TACO 4ª edição, 2011"). Comercial: confirma com a instituição.
+- **TACO JSON**: mirror de [github.com/marcelosanto/tabela_taco](https://github.com/marcelosanto/tabela_taco).
+- **Vitat**: dados são públicos; uso pessoal/individual via endpoints `_next/data`. Não fazemos scraping em massa — apenas on-demand quando o usuário busca um alimento específico.

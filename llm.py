@@ -7,7 +7,8 @@ from typing import Any
 import httpx
 
 from agent.prompts import (
-    VISION_SYSTEM_PROMPT, MENU_PARSE_SYSTEM_PROMPT, RERANK_SYSTEM_PROMPT
+    VISION_SYSTEM_PROMPT, MENU_PARSE_SYSTEM_PROMPT, WATCH_PARSE_SYSTEM_PROMPT,
+    SCALE_PARSE_SYSTEM_PROMPT, RERANK_SYSTEM_PROMPT,
 )
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -74,6 +75,26 @@ async def parse_menu_image(image_bytes: bytes, mime_type: str, model: str) -> di
     """Foto de cardápio → lista de pratos."""
     messages = [{"role": "system", "content": MENU_PARSE_SYSTEM_PROMPT}] + _image_message(
         "Extraia os itens deste cardápio.", image_bytes, mime_type
+    )
+    raw = await _post(model, messages)
+    content = raw["choices"][0]["message"]["content"]
+    return json.loads(content)
+
+
+async def parse_watch_image(image_bytes: bytes, mime_type: str, model: str) -> dict:
+    """Foto de relógio fitness → dados de treino."""
+    messages = [{"role": "system", "content": WATCH_PARSE_SYSTEM_PROMPT}] + _image_message(
+        "Extraia os dados de treino deste screenshot.", image_bytes, mime_type
+    )
+    raw = await _post(model, messages)
+    content = raw["choices"][0]["message"]["content"]
+    return json.loads(content)
+
+
+async def parse_scale_image(image_bytes: bytes, mime_type: str, model: str) -> dict:
+    """Foto de balança → peso em kg."""
+    messages = [{"role": "system", "content": SCALE_PARSE_SYSTEM_PROMPT}] + _image_message(
+        "Leia o peso nesta balança.", image_bytes, mime_type
     )
     raw = await _post(model, messages)
     content = raw["choices"][0]["message"]["content"]
