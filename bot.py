@@ -167,7 +167,7 @@ Ex: 'quero definir minha meta', 'foto do cardápio, quero algo com carne',
 /semana — total dos últimos 7 dias
 /grafico — gráfico do dia (anel kcal + macros + refeições)
 /relatorio [semana|mes|N] — gráfico de intake vs queimado vs meta
-/lembrete [off|on|0-23] — lembrete diário de pesagem
+/lembrete [off|on|HH:MM] — lembrete diário de pesagem (ex: 6:30, 7, 06:35)
 /apagar — remove a última refeição
 /buscar &lt;termo&gt; — busca alimento no banco
 /modelo [slug] — vê/troca o modelo de visão
@@ -283,13 +283,39 @@ async def cmd_grafico(update: Update, _) -> None:
     await update.message.reply_photo(photo=io.BytesIO(png))
 
 
+def _parse_hhmm(s: str) -> tuple[int, int] | None:
+    """Aceita: '6', '06', '6:30', '06:30', '6.30', '630', '0630'.
+    Retorna (hour, minute) ou None."""
+    s = s.strip().replace(".", ":").replace("h", ":")
+    if ":" in s:
+        try:
+            h_s, m_s = s.split(":", 1)
+            h, m = int(h_s), int(m_s)
+        except ValueError:
+            return None
+    elif s.isdigit():
+        if len(s) <= 2:
+            h, m = int(s), 0
+        elif len(s) in (3, 4):
+            h, m = int(s[:-2]), int(s[-2:])
+        else:
+            return None
+    else:
+        return None
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        return None
+    return h, m
+
+
 async def cmd_lembrete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Configurar lembrete diário de pesagem.
     Uso:
-      /lembrete         → mostra atual
-      /lembrete off     → desliga
-      /lembrete on      → liga (padrão 6h)
-      /lembrete 7       → muda hora pra 7h
+      /lembrete            → mostra atual
+      /lembrete off        → desliga
+      /lembrete on         → liga (mantém horário atual)
+      /lembrete 7          → muda pra 07:00
+      /lembrete 6:30       → muda pra 06:30
+      /lembrete 06:35      → muda pra 06:35
     """
     if not _guard(update): return
     user_id = update.effective_user.id
@@ -298,14 +324,19 @@ async def cmd_lembrete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if not args:
         enabled = p.get("weigh_in_enabled", True)
-        hour = p.get("weigh_in_hour", 6)
+        hour = p.get("weigh_in_hour", 6) or 6
+        minute = p.get("weigh_in_minute", 0) or 0
         status = "✅ ligado" if enabled else "❌ desligado"
         await update.message.reply_text(
-            f"Lembrete de pesagem: {status} às {hour}h ({p.get('weigh_in_tz','America/Sao_Paulo')})\n\n"
+            f"Lembrete de pesagem: {status} às <b>{hour:02d}:{minute:02d}</b> "
+            f"({p.get('weigh_in_tz','America/Sao_Paulo')})\n\n"
             "Uso:\n"
-            "  /lembrete off  — desliga\n"
-            "  /lembrete on   — liga\n"
-            "  /lembrete 7    — muda pra 7h"
+            "  <code>/lembrete off</code>  — desliga\n"
+            "  <code>/lembrete on</code>   — liga\n"
+            "  <code>/lembrete 7</code>    — 07:00\n"
+            "  <code>/lembrete 6:30</code> — 06:30\n"
+            "  <code>/lembrete 06:35</code> — 06:35",
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -313,16 +344,30 @@ async def cmd_lembrete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if arg == "off":
         await db.upsert_profile_field(user_id, "weigh_in_enabled", False)
         await update.message.reply_text("Lembrete desligado.")
-    elif arg == "on":
+        return
+    if arg == "on":
         await db.upsert_profile_field(user_id, "weigh_in_enabled", True)
-        await update.message.reply_text(f"Lembrete ligado às {p.get('weigh_in_hour', 6)}h.")
-    elif arg.isdigit() and 0 <= int(arg) <= 23:
-        h = int(arg)
-        await db.upsert_profile_field(user_id, "weigh_in_hour", h)
-        await db.upsert_profile_field(user_id, "weigh_in_enabled", True)
-        await update.message.reply_text(f"Lembrete configurado pra {h}h.")
-    else:
-        await update.message.reply_text("Uso: /lembrete [off|on|0-23]")
+        h = p.get("weigh_in_hour", 6) or 6
+        m = p.get("weigh_in_minute", 0) or 0
+        await update.message.reply_text(f"Lembrete ligado às {h:02d}:{m:02d}.")
+        return
+
+    parsed = _parse_hhmm(arg)
+    if parsed is None:
+        await update.message.reply_text(
+            "Formato inválido. Use:\n"
+            "  /lembrete 7        (07:00)\n"
+            "  /lembrete 6:30     (06:30)\n"
+            "  /lembrete off"
+        )
+        return
+
+    h, m = parsed
+    await db.upsert_profile_field(user_id, "weigh_in_hour", h)
+    await db.upsert_profile_field(user_id, "weigh_in_minute", m)
+    await db.upsert_profile_field(user_id, "weigh_in_enabled", True)
+    await update.message.reply_text(f"Lembrete configurado pra <b>{h:02d}:{m:02d}</b>.",
+                                     parse_mode=ParseMode.HTML)
 
 
 async def cmd_reset(update: Update, _) -> None:
@@ -523,7 +568,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ============================================================
 
 async def _weigh_in_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Job que roda toda hora. Checa quais users devem receber lembrete agora."""
+    """Job que roda a cada minuto. Dispara lembretes pra users no horário local certo."""
     from datetime import datetime as _dt
     from zoneinfo import ZoneInfo
     try:
@@ -540,7 +585,9 @@ async def _weigh_in_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             continue
         hour = u.get("weigh_in_hour", 6)
-        if local.hour != hour:
+        minute = u.get("weigh_in_minute") or 0
+        # match exato de HH:MM no horário local do user
+        if local.hour != hour or local.minute != minute:
             continue
         today_local = local.date()
         if u.get("weigh_in_last_date") == today_local:
@@ -557,7 +604,8 @@ async def _weigh_in_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode=ParseMode.HTML,
             )
             await db.mark_reminder_sent(u["user_id"], today_local)
-            log.info("lembrete enviado pra user_id=%s", u["user_id"])
+            log.info("lembrete enviado pra user_id=%s (%02d:%02d local)",
+                     u["user_id"], hour, minute)
         except Exception:
             log.exception("falha enviando lembrete user_id=%s", u.get("user_id"))
 
@@ -572,9 +620,9 @@ async def _post_init(app: Application) -> None:
     # Job de lembrete: roda no minuto 0 de cada hora
     from datetime import time as _time
     app.job_queue.run_repeating(
-        _weigh_in_job, interval=3600, first=10, name="weigh_in_reminder"
+        _weigh_in_job, interval=60, first=10, name="weigh_in_reminder"
     )
-    log.info("Lembrete de pesagem agendado (verifica a cada hora).")
+    log.info("Lembrete de pesagem agendado (verifica a cada minuto).")
 
 
 async def _post_shutdown(app: Application) -> None:
