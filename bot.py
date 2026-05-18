@@ -22,6 +22,7 @@ from telegram.ext import (
 )
 
 import calculator
+import commands
 import db
 import llm
 import matcher
@@ -209,54 +210,38 @@ def _meal_keyboard(meal_id: int, items: list[dict]) -> InlineKeyboardMarkup:
 
 
 # ============================================================
-# Comandos
+# Comandos — lógica em commands.py (agnóstica de canal)
 # ============================================================
 
-COMMANDS_HELP = """\
-🎯 <b>Botões fixos embaixo</b> — atalhos pras ações comuns:
-  🍽 Refeição · ⚖️ Peso · 🏃 Treino · 📊 Hoje · 🎯 Meta · ⚙️ Mais
-
-💬 <b>Ou escreva livre</b>: 'comi 100g arroz e bife', 'como tá meu dia?',
-'foto do cardápio, quero algo com carne', '101.8' (peso direto).
-
-📷 <b>Mande foto direta</b> — identifico prato, cardápio, relógio ou balança.
-
-<b>Todos os comandos (também acessíveis via botões):</b>
-/start /ajuda — esta mensagem
-/perfil — perfil e meta
-/hoje /semana — totais do período
-/grafico — anel kcal + macros + refeições
-/relatorio [semana|mes|N] — gráfico do período
-/lembrete [off|on|HH:MM] — lembrete diário de pesagem (ex: 6:30, 7, 06:35)
-/apagar — remove última refeição
-/buscar &lt;termo&gt; — busca alimento
-/modelo [slug] — troca modelo de visão
-/reset — nova conversa
-
-<b>Marcadores:</b>
-✅ TACO   🌿 Vitat   🟡 estimativa   ❌ sem dados
-"""
+async def _send_result(update: Update, r: commands.CommandResult,
+                       reply_markup=None) -> None:
+    """Envia CommandResult: texto HTML (se houver) + foto (se houver)."""
+    if r.text:
+        try:
+            await update.message.reply_text(
+                r.text, parse_mode=ParseMode.HTML, reply_markup=reply_markup,
+            )
+        except Exception:
+            await update.message.reply_text(r.text, reply_markup=reply_markup)
+    if r.png:
+        await update.message.reply_photo(photo=io.BytesIO(r.png))
 
 
 async def cmd_start(update: Update, _) -> None:
     u = update.effective_user
     log.info("start from user_id=%s username=%s", u.id, u.username)
-    n = await db.count_foods()
-    await update.message.reply_text(
-        f"Oi! Seu user_id é <code>{u.id}</code>. Base nutricional: {n} alimentos.\n\n"
-        f"{COMMANDS_HELP}\n"
-        "👉 Sem perfil ainda? Diga <i>'quero definir minha meta'</i> pra começar o onboarding.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=MAIN_KB,
-    )
+    r = await commands.cmd_start(u.id, [])
+    await _send_result(update, r, reply_markup=MAIN_KB)
 
 
 async def cmd_ajuda(update: Update, _) -> None:
     if not _guard(update): return
-    await update.message.reply_text(COMMANDS_HELP, parse_mode=ParseMode.HTML, reply_markup=MAIN_KB)
+    r = await commands.cmd_ajuda(update.effective_user.id, [])
+    await _send_result(update, r, reply_markup=MAIN_KB)
 
 
 async def cmd_modelo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Telegram-only: aceita escrita (atualiza bot_data em memória)."""
     if not _guard(update): return
     if context.args:
         new = " ".join(context.args).strip()
@@ -271,247 +256,56 @@ async def cmd_modelo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_buscar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _guard(update): return
-    if not context.args:
-        await update.message.reply_text("Uso: /buscar arroz integral")
-        return
-    name = " ".join(context.args)
-    m = await matcher.match_one(name)
-    if not m.alternatives:
-        await update.message.reply_text("Nada encontrado.")
-        return
-    lines = [f"Para '{_esc(name)}':"]
-    for a in m.alternatives[:5]:
-        marker = " ⭐" if a["id"] == m.food_id else ""
-        lines.append(f"  • {_esc(a['name'])} (sim {a['score']:.2f}){marker}")
-    lines.append(f"\nMétodo: {m.method}")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    r = await commands.cmd_buscar(update.effective_user.id, list(context.args or []))
+    await _send_result(update, r)
 
 
 async def cmd_hoje(update: Update, _) -> None:
     if not _guard(update): return
-    from zoneinfo import ZoneInfo
-    user_id = update.effective_user.id
-    profile = await db.get_profile(user_id) or {}
-    tz_name = profile.get("timezone") or "America/Sao_Paulo"
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = ZoneInfo("America/Sao_Paulo")
-    meals = await db.list_today(user_id)
-    if not meals:
-        await update.message.reply_text("Nada registrado hoje.")
-        return
-    lines = []
-    tot_k = tot_p = tot_c = tot_f = 0.0
-    for m in meals:
-        items = m["items"] if isinstance(m["items"], list) else json.loads(m["items"])
-        names = ", ".join(i.get("food_name") or i["name_llm"] for i in items[:3])
-        local_time = m["eaten_at"].astimezone(tz).strftime("%H:%M")
-        lines.append(f"#{m['id']}  {local_time}  {_esc(names)}  — {float(m['kcal']):.0f} kcal")
-        tot_k += float(m["kcal"]); tot_p += float(m["protein_g"])
-        tot_c += float(m["carbs_g"]); tot_f += float(m["fat_g"])
-    await update.message.reply_text(
-        f"<b>Hoje</b> ({len(meals)} refeições)\n" + "\n".join(lines) +
-        f"\n\n🔥 <b>{tot_k:.0f} kcal</b>\nP {tot_p:.0f}  C {tot_c:.0f}  G {tot_f:.0f}",
-        parse_mode=ParseMode.HTML,
-    )
+    r = await commands.cmd_hoje(update.effective_user.id, [])
+    await _send_result(update, r)
 
 
 async def cmd_semana(update: Update, _) -> None:
     if not _guard(update): return
-    from datetime import datetime, timedelta, timezone
-    s = await db.summary_since(update.effective_user.id, datetime.now(timezone.utc) - timedelta(days=7))
-    if not s["n"]:
-        await update.message.reply_text("Sem refeições nos últimos 7 dias.")
-        return
-    await update.message.reply_text(
-        f"<b>Últimos 7 dias</b> — {s['n']} refeições\n"
-        f"Total: {float(s['kcal']):.0f} kcal\n"
-        f"Média/dia: {float(s['kcal'])/7:.0f} kcal\n"
-        f"P {float(s['protein_g']):.0f}  C {float(s['carbs_g']):.0f}  G {float(s['fat_g']):.0f}",
-        parse_mode=ParseMode.HTML,
-    )
+    r = await commands.cmd_semana(update.effective_user.id, [])
+    await _send_result(update, r)
 
 
 async def cmd_apagar(update: Update, _) -> None:
     if not _guard(update): return
-    d = await db.delete_last(update.effective_user.id)
-    await update.message.reply_text(f"Removido #{d}." if d else "Nada pra apagar.")
+    r = await commands.cmd_apagar(update.effective_user.id, [])
+    await _send_result(update, r)
 
 
 async def cmd_grafico(update: Update, _) -> None:
-    """Gera e envia o gráfico do dia direto, sem passar pelo agente."""
     if not _guard(update): return
-    from agent.tools import _build_daily_chart
-    user_id = update.effective_user.id
-    try:
-        png = await _build_daily_chart(user_id)
-    except Exception as e:
-        log.exception("erro gerando gráfico")
-        await update.message.reply_text(f"Falha gerando gráfico: {e}")
-        return
-    await update.message.reply_photo(photo=io.BytesIO(png))
-
-
-def _parse_hhmm(s: str) -> tuple[int, int] | None:
-    """Aceita: '6', '06', '6:30', '06:30', '6.30', '630', '0630'.
-    Retorna (hour, minute) ou None."""
-    s = s.strip().replace(".", ":").replace("h", ":")
-    if ":" in s:
-        try:
-            h_s, m_s = s.split(":", 1)
-            h, m = int(h_s), int(m_s)
-        except ValueError:
-            return None
-    elif s.isdigit():
-        if len(s) <= 2:
-            h, m = int(s), 0
-        elif len(s) in (3, 4):
-            h, m = int(s[:-2]), int(s[-2:])
-        else:
-            return None
-    else:
-        return None
-    if not (0 <= h <= 23 and 0 <= m <= 59):
-        return None
-    return h, m
+    r = await commands.cmd_grafico(update.effective_user.id, [])
+    await _send_result(update, r)
 
 
 async def cmd_lembrete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Configurar lembrete diário de pesagem.
-    Uso:
-      /lembrete            → mostra atual
-      /lembrete off        → desliga
-      /lembrete on         → liga (mantém horário atual)
-      /lembrete 7          → muda pra 07:00
-      /lembrete 6:30       → muda pra 06:30
-      /lembrete 06:35      → muda pra 06:35
-    """
     if not _guard(update): return
-    user_id = update.effective_user.id
-    args = context.args
-    p = await db.get_profile(user_id) or {}
-
-    if not args:
-        enabled = p.get("weigh_in_enabled", True)
-        hour = p.get("weigh_in_hour", 6) or 6
-        minute = p.get("weigh_in_minute", 0) or 0
-        status = "✅ ligado" if enabled else "❌ desligado"
-        await update.message.reply_text(
-            f"Lembrete de pesagem: {status} às <b>{hour:02d}:{minute:02d}</b> "
-            f"({p.get('weigh_in_tz','America/Sao_Paulo')})\n\n"
-            "Uso:\n"
-            "  <code>/lembrete off</code>  — desliga\n"
-            "  <code>/lembrete on</code>   — liga\n"
-            "  <code>/lembrete 7</code>    — 07:00\n"
-            "  <code>/lembrete 6:30</code> — 06:30\n"
-            "  <code>/lembrete 06:35</code> — 06:35",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    arg = args[0].lower()
-    if arg == "off":
-        await db.upsert_profile_field(user_id, "weigh_in_enabled", False)
-        await update.message.reply_text("Lembrete desligado.")
-        return
-    if arg == "on":
-        await db.upsert_profile_field(user_id, "weigh_in_enabled", True)
-        h = p.get("weigh_in_hour", 6) or 6
-        m = p.get("weigh_in_minute", 0) or 0
-        await update.message.reply_text(f"Lembrete ligado às {h:02d}:{m:02d}.")
-        return
-
-    parsed = _parse_hhmm(arg)
-    if parsed is None:
-        await update.message.reply_text(
-            "Formato inválido. Use:\n"
-            "  /lembrete 7        (07:00)\n"
-            "  /lembrete 6:30     (06:30)\n"
-            "  /lembrete off"
-        )
-        return
-
-    h, m = parsed
-    await db.upsert_profile_field(user_id, "weigh_in_hour", h)
-    await db.upsert_profile_field(user_id, "weigh_in_minute", m)
-    await db.upsert_profile_field(user_id, "weigh_in_enabled", True)
-    await update.message.reply_text(f"Lembrete configurado pra <b>{h:02d}:{m:02d}</b>.",
-                                     parse_mode=ParseMode.HTML)
+    r = await commands.cmd_lembrete(update.effective_user.id, list(context.args or []))
+    await _send_result(update, r)
 
 
 async def cmd_reset(update: Update, _) -> None:
-    """Fecha a conversa atual com o agente. Próxima msg cria uma nova."""
     if not _guard(update): return
-    await db.close_active_conversation(update.effective_user.id)
-    await update.message.reply_text("Conversa zerada. 🔄 Próxima mensagem começa do zero.")
+    r = await commands.cmd_reset(update.effective_user.id, [])
+    await _send_result(update, r)
 
 
 async def cmd_perfil(update: Update, _) -> None:
-    """Mostra perfil + meta. Onboarding fica com o agente."""
     if not _guard(update): return
-    p = await db.get_profile(update.effective_user.id)
-    if not p:
-        await update.message.reply_text(
-            "Sem perfil ainda. Manda uma mensagem tipo 'quero definir minha meta' "
-            "que eu te conduzo no onboarding."
-        )
-        return
-    missing = [k for k in ("sex", "birth_date", "height_cm", "current_weight_kg",
-                            "target_weight_kg", "activity_level", "weekly_rate_kg")
-               if p.get(k) is None]
-    lines = [
-        f"<b>Perfil</b> de {_esc(p.get('name') or '—')}",
-        f"  Sexo: {_esc(p.get('sex') or '—')}",
-        f"  Nascimento: {_esc(p.get('birth_date') or '—')}",
-        f"  Altura: {p.get('height_cm') or '—'} cm",
-        f"  Peso atual: {p.get('current_weight_kg') or '—'} kg",
-        f"  Peso-alvo: {p.get('target_weight_kg') or '—'} kg",
-        f"  Atividade: {_esc(p.get('activity_level') or '—')}",
-        f"  Ritmo: {p.get('weekly_rate_kg') or '—'} kg/semana",
-        f"  Eat-back: {p.get('eatback_pct') or 100}%",
-    ]
-    if p.get("daily_kcal"):
-        lines.append(f"\n🎯 <b>Meta: {p['daily_kcal']} kcal/dia</b> ({p.get('daily_protein_g')}g proteína)")
-    if missing:
-        lines.append(f"\n⚠️ Faltam: {', '.join(missing)}")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    r = await commands.cmd_perfil(update.effective_user.id, [])
+    await _send_result(update, r)
 
 
 async def cmd_relatorio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Relatório do período + gráfico. Args: 'semana' (7d) ou 'mes' (30d) ou número."""
     if not _guard(update): return
-    arg = (context.args[0].lower() if context.args else "semana")
-    days = 30 if arg in ("mes", "mês", "30") else 7
-    if arg.isdigit():
-        days = max(1, min(90, int(arg)))
-
-    user_id = update.effective_user.id
-    summary = await db.period_summary(user_id, days)
-    p = await db.get_profile(user_id)
-    goal = p.get("daily_kcal") if p else None
-
-    # Texto resumo
-    totals = summary["totals"]
-    avgs = summary["averages"]
-    text = (
-        f"<b>Relatório — últimos {days} dias</b>\n"
-        f"Intake total: {totals['intake_kcal']:.0f} kcal\n"
-        f"Queimado total: {totals['burned_kcal']} kcal\n"
-        f"Net total: {totals['net_kcal']:.0f} kcal\n\n"
-        f"<b>Médias/dia:</b>\n"
-        f"  Intake: {avgs['intake_per_day']:.0f} kcal"
-        + (f" (meta {goal})" if goal else "") + "\n"
-        f"  Queimado: {avgs['burned_per_day']:.0f} kcal\n"
-        f"  Net: {avgs['net_per_day']:.0f} kcal"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-
-    # Gráfico
-    from agent import charts
-    png = charts.daily_intake_vs_goal(summary["per_day"], goal_kcal=goal,
-                                       title=f"Últimos {days} dias")
-    await update.message.reply_photo(photo=io.BytesIO(png))
+    r = await commands.cmd_relatorio(update.effective_user.id, list(context.args or []))
+    await _send_result(update, r)
 
 
 # ============================================================
