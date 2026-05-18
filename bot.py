@@ -7,7 +7,10 @@ import re
 from datetime import timezone
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
+    ReplyKeyboardMarkup, Update,
+)
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
@@ -30,6 +33,29 @@ logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", le
 log = logging.getLogger("health-chat")
 
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"]) if os.getenv("ALLOWED_USER_ID") else None
+
+
+# ============================================================
+# Reply Keyboard — botões persistentes embaixo do chat
+# ============================================================
+MAIN_KB = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("🍽 Refeição"), KeyboardButton("⚖️ Peso"), KeyboardButton("🏃 Treino")],
+        [KeyboardButton("📊 Hoje"), KeyboardButton("🎯 Meta"), KeyboardButton("⚙️ Mais")],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+MORE_KB = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("📈 Relatório"), KeyboardButton("⏰ Lembrete")],
+        [KeyboardButton("🔍 Buscar"), KeyboardButton("❓ Ajuda")],
+        [KeyboardButton("🔄 Nova conversa"), KeyboardButton("⬅️ Voltar")],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 
 
 def _esc(s) -> str:
@@ -187,27 +213,27 @@ def _meal_keyboard(meal_id: int, items: list[dict]) -> InlineKeyboardMarkup:
 # ============================================================
 
 COMMANDS_HELP = """\
-📷 <b>Foto</b> (prato, cardápio, relógio fitness ou balança) → agente decide
-💬 <b>Texto livre</b> → conversa natural com o agente
+🎯 <b>Botões fixos embaixo</b> — atalhos pras ações comuns:
+  🍽 Refeição · ⚖️ Peso · 🏃 Treino · 📊 Hoje · 🎯 Meta · ⚙️ Mais
 
-Ex: 'quero definir minha meta', 'foto do cardápio, quero algo com carne',
-    'como tá meu dia?', 'fiz 1h de corrida', '101.8' (loga peso direto)
+💬 <b>Ou escreva livre</b>: 'comi 100g arroz e bife', 'como tá meu dia?',
+'foto do cardápio, quero algo com carne', '101.8' (peso direto).
 
-<b>Comandos diretos:</b>
-/start — esta mensagem
-/ajuda — mesma coisa
-/perfil — vê seu perfil e meta calórica
-/hoje — refeições do dia + total
-/semana — total dos últimos 7 dias
-/grafico — gráfico do dia (anel kcal + macros + refeições)
-/relatorio [semana|mes|N] — gráfico de intake vs queimado vs meta
+📷 <b>Mande foto direta</b> — identifico prato, cardápio, relógio ou balança.
+
+<b>Todos os comandos (também acessíveis via botões):</b>
+/start /ajuda — esta mensagem
+/perfil — perfil e meta
+/hoje /semana — totais do período
+/grafico — anel kcal + macros + refeições
+/relatorio [semana|mes|N] — gráfico do período
 /lembrete [off|on|HH:MM] — lembrete diário de pesagem (ex: 6:30, 7, 06:35)
-/apagar — remove a última refeição
-/buscar &lt;termo&gt; — busca alimento no banco
-/modelo [slug] — vê/troca o modelo de visão
-/reset — começa nova conversa com o agente
+/apagar — remove última refeição
+/buscar &lt;termo&gt; — busca alimento
+/modelo [slug] — troca modelo de visão
+/reset — nova conversa
 
-<b>Marcadores nas respostas:</b>
+<b>Marcadores:</b>
 ✅ TACO   🌿 Vitat   🟡 estimativa   ❌ sem dados
 """
 
@@ -221,12 +247,13 @@ async def cmd_start(update: Update, _) -> None:
         f"{COMMANDS_HELP}\n"
         "👉 Sem perfil ainda? Diga <i>'quero definir minha meta'</i> pra começar o onboarding.",
         parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_KB,
     )
 
 
 async def cmd_ajuda(update: Update, _) -> None:
     if not _guard(update): return
-    await update.message.reply_text(COMMANDS_HELP, parse_mode=ParseMode.HTML)
+    await update.message.reply_text(COMMANDS_HELP, parse_mode=ParseMode.HTML, reply_markup=MAIN_KB)
 
 
 async def cmd_modelo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -500,9 +527,89 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _agent_handle(update, context, text=caption, photo_file_id=photo.file_id)
 
 
+# ============================================================
+# Reply keyboard: dispatcher de botões
+# ============================================================
+async def _btn_refeicao(update: Update, _) -> None:
+    await update.message.reply_text(
+        "🍽 <b>Logar refeição</b>\n\n"
+        "Você pode:\n"
+        "• Mandar foto do prato → eu analiso\n"
+        "• Descrever em texto: 'comi 100g arroz e 150g frango'\n"
+        "• Mandar foto de cardápio + 'quero algo com carne'",
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_KB,
+    )
+
+
+async def _btn_peso(update: Update, _) -> None:
+    await update.message.reply_text(
+        "⚖️ <b>Logar peso</b>\n\n"
+        "Manda só o número (ex: <code>101.8</code>) ou foto da balança.\n"
+        "Eu atualizo seu peso e recalculo a meta automaticamente.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_KB,
+    )
+
+
+async def _btn_treino(update: Update, _) -> None:
+    await update.message.reply_text(
+        "🏃 <b>Logar treino</b>\n\n"
+        "Você pode:\n"
+        "• Mandar foto do relógio (Apple Watch, Garmin, Strava)\n"
+        "• Descrever em texto: 'fiz 1h de corrida, 480 kcal'",
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_KB,
+    )
+
+
+async def _btn_mais(update: Update, _) -> None:
+    await update.message.reply_text("⚙️ Mais opções:", reply_markup=MORE_KB)
+
+
+async def _btn_voltar(update: Update, _) -> None:
+    await update.message.reply_text("⬅️ Voltar", reply_markup=MAIN_KB)
+
+
+async def _btn_buscar(update: Update, _) -> None:
+    await update.message.reply_text(
+        "🔍 Use: <code>/buscar &lt;termo&gt;</code>\nEx: <code>/buscar arroz integral</code>",
+        parse_mode=ParseMode.HTML, reply_markup=MAIN_KB,
+    )
+
+
+async def _btn_relatorio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Sem args → semana
+    context.args = []
+    await cmd_relatorio(update, context)
+
+
+# Mapa: texto do botão → handler
+BUTTON_HANDLERS = {
+    "🍽 Refeição": _btn_refeicao,
+    "⚖️ Peso": _btn_peso,
+    "🏃 Treino": _btn_treino,
+    "📊 Hoje": lambda u, c: cmd_hoje(u, c),
+    "🎯 Meta": lambda u, c: cmd_perfil(u, c),
+    "⚙️ Mais": _btn_mais,
+    "📈 Relatório": _btn_relatorio,
+    "⏰ Lembrete": lambda u, c: cmd_lembrete(u, c),
+    "🔍 Buscar": _btn_buscar,
+    "❓ Ajuda": lambda u, c: cmd_ajuda(u, c),
+    "🔄 Nova conversa": lambda u, c: cmd_reset(u, c),
+    "⬅️ Voltar": _btn_voltar,
+}
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _guard(update): return
-    await _agent_handle(update, context, text=update.message.text, photo_file_id=None)
+    text = update.message.text or ""
+    # Intercepta botões antes do agente (não gasta tokens)
+    handler = BUTTON_HANDLERS.get(text.strip())
+    if handler:
+        await handler(update, context)
+        return
+    await _agent_handle(update, context, text=text, photo_file_id=None)
 
 
 async def _agent_handle(update: Update, context: ContextTypes.DEFAULT_TYPE,
