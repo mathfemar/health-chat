@@ -55,7 +55,9 @@ def _md_to_html(text: str) -> str:
     text = re.sub(r"`([^`]+?)`", r"<code>\1</code>", text)
     # Múltiplas quebras viram no máximo 2
     text = re.sub(r"\n{3,}", "\n\n", text)
-    # Sanitiza HTML: rebalanceia <b><i><code><u><s>. Tags fora desse set viram texto.
+    # Normaliza malformações comuns do LLM (<tag/>, <<tag>, <//tag>)
+    text = _normalize_llm_html_garbage(text)
+    # Sanitiza HTML: balanceia open/close, escapa < > órfãos
     text = _balance_html_tags(text)
     return text.strip()
 
@@ -63,38 +65,70 @@ def _md_to_html(text: str) -> str:
 _ALLOWED_TG_TAGS = {"b", "i", "u", "s", "code", "pre", "strong", "em"}
 
 
+_CLEAN_TAG_RE = re.compile(
+    r"<(/?)(" + "|".join(_ALLOWED_TG_TAGS) + r")(\s+[^<>]*?)?(/?)>",
+    re.IGNORECASE,
+)
+
+
+def _normalize_llm_html_garbage(text: str) -> str:
+    """Conserta malformações específicas do LLM (preserva texto matemático tipo 'a < b > c'):
+      <//tag>  →  </tag>     (double-slash close)
+      <<tag>   →  <tag>      (double-opener, só se colado sem espaço)
+      <tag/>   →  <tag>      (XHTML self-close de tag que normalmente tem conteúdo)
+    Cada padrão exige a tag estar SEM espaço — pra não tocar em '<' avulso do texto."""
+    allowed = "|".join(_ALLOWED_TG_TAGS)
+    # <//tag> ou <///tag> → </tag>  (sem espaço entre < e /, e entre / e nome)
+    text = re.sub(rf"<//+({allowed})>", r"</\1>", text, flags=re.IGNORECASE)
+    # <<tag> ou <<<tag> → <tag>  (apenas múltiplos `<` consecutivos, sem espaço)
+    text = re.sub(rf"<{{2,}}({allowed})(\s+[^<>]*?)?(/?)>", r"<\1\2\3>", text, flags=re.IGNORECASE)
+    # <tag/> → <tag>  (XHTML self-close, sem espaço entre nome e /)
+    text = re.sub(rf"<({allowed})/>", r"<\1>", text, flags=re.IGNORECASE)
+    return text
+
+
 def _balance_html_tags(text: str) -> str:
-    """Remove tags não suportadas pelo Telegram e fecha tags órfãs.
-    Telegram HTML aceita só: b, strong, i, em, u, s, code, pre, a.
-    Tags que abrem sem fechar (ou vice-versa) seriam rejeitadas — limpamos."""
-    # Remove tags não-permitidas (mantém o conteúdo)
-    def _strip_tag(m: re.Match) -> str:
-        name = m.group(1).lower()
-        return m.group(0) if name in _ALLOWED_TG_TAGS else ""
-    text = re.sub(r"</?([a-zA-Z][a-zA-Z0-9]*)\b[^>]*>", _strip_tag, text)
-    # Balanceia: pra cada tag aberta, garante que tem fechamento; cada fechamento órfão vira texto
+    """Sanitizador agressivo pra HTML do Telegram.
+
+    Reconhece SÓ tags limpas e válidas (<b>, </b>, <code>, <code/>, <code attr="x">).
+    Tags malformadas (<code/>/lembrete<//code>, <<, <div>, <b\n) e seus '<' '>'
+    sobrevivem como TEXTO ESCAPADO — Telegram não rejeita a mensagem inteira.
+    Balanceia open/close: open órfão fecha no fim; close órfão vira nada.
+    """
+    tokens: list[tuple[str, str]] = []
+    i = 0
+    for m in _CLEAN_TAG_RE.finditer(text):
+        if m.start() > i:
+            tokens.append(("text", text[i:m.start()]))
+        slash_open = m.group(1)
+        name = m.group(2).lower()
+        slash_close = m.group(4)
+        if slash_open == "/":
+            tokens.append(("close", name))
+        else:
+            tokens.append(("open", name))
+            if slash_close == "/":  # XHTML self-close vira open+close imediato
+                tokens.append(("close", name))
+        i = m.end()
+    if i < len(text):
+        tokens.append(("text", text[i:]))
+
     stack: list[str] = []
     out: list[str] = []
-    i = 0
-    tag_re = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)\b[^>]*>")
-    for m in tag_re.finditer(text):
-        out.append(text[i:m.start()])
-        i = m.end()
-        is_close = m.group(1) == "/"
-        name = m.group(2).lower()
-        if not is_close:
-            stack.append(name)
-            out.append(m.group(0))
-        else:
-            if name in stack:
-                # fecha tudo até esse — feio mas seguro
-                while stack and stack[-1] != name:
+    for kind, val in tokens:
+        if kind == "text":
+            # Escapa < > & órfãos pra não confundir o parser do Telegram
+            out.append(val.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+        elif kind == "open":
+            stack.append(val)
+            out.append(f"<{val}>")
+        elif kind == "close":
+            if val in stack:
+                while stack and stack[-1] != val:
                     out.append(f"</{stack.pop()}>")
                 stack.pop()
-                out.append(f"</{name}>")
-            # senão: tag de fechamento órfã, descarta
-    out.append(text[i:])
-    # Fecha tags abertas no final
+                out.append(f"</{val}>")
+            # close órfão: descarta silenciosamente
     while stack:
         out.append(f"</{stack.pop()}>")
     return "".join(out)
