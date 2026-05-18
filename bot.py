@@ -612,17 +612,29 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _agent_handle(update, context, text=text, photo_file_id=None)
 
 
+async def _telegram_download_photo(bot, file_id: str) -> bytes | None:
+    """Adapter: baixa foto pelo file_id do Telegram, retorna bytes."""
+    f = await bot.get_file(file_id)
+    buf = io.BytesIO()
+    await f.download_to_memory(out=buf)
+    return buf.getvalue()
+
+
 async def _agent_handle(update: Update, context: ContextTypes.DEFAULT_TYPE,
                         text: str, photo_file_id: str | None) -> None:
     """Rota pro agente conversacional."""
     msg = update.message
     await msg.chat.send_action(ChatAction.TYPING)
+
+    async def _dl(pid: str) -> bytes | None:
+        return await _telegram_download_photo(context.bot, pid)
+
     try:
         reply = await agent.run_turn(
             user_id=update.effective_user.id,
             user_text=text,
             photo_file_id=photo_file_id,
-            bot=context.bot,
+            download_photo=_dl,
             vision_model=_current_model(context),
         )
     except Exception as e:
@@ -749,14 +761,36 @@ async def _weigh_in_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             "Manda só o número (ex: 101.8) ou foto da balança "
             "que eu atualizo seu peso e recalculo a meta do dia."
         )
+        sent_any = False
         try:
             await context.bot.send_message(
                 chat_id=u["user_id"],
                 text=reminder_text,
             )
-            await db.mark_reminder_sent(u["user_id"], today_local)
-            log.info("lembrete enviado pra user_id=%s (%02d:%02d local)",
+            sent_any = True
+            log.info("lembrete telegram enviado pra user_id=%s (%02d:%02d local)",
                      u["user_id"], hour, minute)
+        except Exception:
+            log.exception("falha enviando lembrete telegram user_id=%s", u.get("user_id"))
+
+        # WhatsApp: se este user_id está vinculado a um número, manda lá também.
+        # (single-user por enquanto: WHATSAPP_LINK_PHONE ↔ ALLOWED_USER_ID)
+        wa_phone = os.environ.get("WHATSAPP_LINK_PHONE")
+        allowed = os.environ.get("ALLOWED_USER_ID")
+        if (wa_phone and allowed and str(u["user_id"]) == allowed
+                and os.environ.get("TWILIO_ACCOUNT_SID")):
+            try:
+                from whatsapp import send_whatsapp_message
+                await send_whatsapp_message(wa_phone, body=reminder_text)
+                sent_any = True
+                log.info("lembrete whatsapp enviado pra %s", wa_phone)
+            except Exception:
+                log.exception("falha enviando lembrete whatsapp")
+
+        if not sent_any:
+            continue
+        try:
+            await db.mark_reminder_sent(u["user_id"], today_local)
             # Salva o lembrete no histórico da conversa do agente — assim quando o
             # user responder com foto/número, o agente tem o contexto pra interpretar.
             try:
@@ -765,7 +799,7 @@ async def _weigh_in_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 log.exception("falha salvando lembrete no histórico (não-crítico)")
         except Exception:
-            log.exception("falha enviando lembrete user_id=%s", u.get("user_id"))
+            log.exception("falha marcando lembrete enviado user_id=%s", u.get("user_id"))
 
 
 async def _post_init(app: Application) -> None:
@@ -787,7 +821,7 @@ async def _post_shutdown(app: Application) -> None:
     await db.close()
 
 
-def main() -> None:
+def _build_telegram_app() -> Application:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     app = (
         Application.builder()
@@ -811,11 +845,76 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    return app
 
+
+def _whatsapp_enabled() -> bool:
+    """WhatsApp adapter sobe só se as creds Twilio estiverem configuradas."""
+    return all(
+        os.environ.get(k)
+        for k in ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_WHATSAPP_FROM",
+                  "WHATSAPP_LINK_PHONE", "PUBLIC_BASE_URL")
+    )
+
+
+async def _run_all() -> None:
+    """Roda Telegram polling + (opcional) FastAPI/Twilio webhook em paralelo."""
+    import asyncio
+    tg_app = _build_telegram_app()
+
+    # Start Telegram (não-bloqueante)
+    await tg_app.initialize()
+    await tg_app.start()
+    await tg_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    log.info("Telegram polling iniciado.")
+
+    server = None
+    if _whatsapp_enabled():
+        import uvicorn
+        from whatsapp import app as wa_app
+        # Injeta o tg_app pro lembrete saber mandar via Telegram também
+        wa_app.state.tg_bot = tg_app.bot
+        port = int(os.environ.get("WHATSAPP_WEBHOOK_PORT", "8000"))
+        host = os.environ.get("WHATSAPP_WEBHOOK_HOST", "0.0.0.0")
+        config = uvicorn.Config(wa_app, host=host, port=port, log_level="info",
+                                lifespan="on")
+        server = uvicorn.Server(config)
+        log.info("WhatsApp adapter iniciando em %s:%s", host, port)
+        server_task = asyncio.create_task(server.serve())
+    else:
+        log.info("WhatsApp adapter desabilitado (faltam creds Twilio no .env). "
+                 "Rodando só Telegram.")
+        server_task = None
+
+    try:
+        # Bloqueia até alguém quebrar (Ctrl+C → KeyboardInterrupt no asyncio.run)
+        if server_task:
+            await server_task
+        else:
+            # Sem WhatsApp: dorme até cancelar
+            while True:
+                await asyncio.sleep(3600)
+    finally:
+        log.info("Encerrando...")
+        if server is not None:
+            server.should_exit = True
+        try:
+            await tg_app.updater.stop()
+        except Exception:
+            pass
+        await tg_app.stop()
+        await tg_app.shutdown()
+
+
+def main() -> None:
+    import asyncio
     log.info("Bot rodando. Visão: %s | Chat: %s",
              os.environ.get("OPENROUTER_MODEL"),
              os.environ.get("OPENROUTER_CHAT_MODEL", "google/gemma-4-31b-it"))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        asyncio.run(_run_all())
+    except KeyboardInterrupt:
+        log.info("interrompido por usuário")
 
 
 if __name__ == "__main__":
