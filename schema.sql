@@ -131,6 +131,15 @@ create table user_profiles (
     weigh_in_minute   int default 0,                       -- minuto (0-59)
     weigh_in_tz       text default 'America/Sao_Paulo',
     weigh_in_last_date date,                               -- última vez que enviamos hoje
+    -- Push proativo de almoço/jantar + sextou
+    push_enabled      boolean default true,
+    push_lunch_hour   int default 13,                      -- HH local (0-23)
+    push_lunch_minute int default 0,
+    push_dinner_hour  int default 20,
+    push_dinner_minute int default 0,
+    push_lunch_last_date date,
+    push_dinner_last_date date,
+    push_friday_last_date date,
     updated_at        timestamptz default now()
 );
 

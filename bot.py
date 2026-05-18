@@ -228,6 +228,7 @@ COMMANDS_HELP = """\
 /grafico — anel kcal + macros + refeições
 /relatorio [semana|mes|N] — gráfico do período
 /lembrete [off|on|HH:MM] — lembrete diário de pesagem (ex: 6:30, 7, 06:35)
+/push [off|on|almoco HH:MM|jantar HH:MM] — nudges de almoço/jantar/sextou
 /apagar — remove última refeição
 /buscar &lt;termo&gt; — busca alimento
 /modelo [slug] — troca modelo de visão
@@ -375,6 +376,71 @@ def _parse_hhmm(s: str) -> tuple[int, int] | None:
     if not (0 <= h <= 23 and 0 <= m <= 59):
         return None
     return h, m
+
+
+async def cmd_push(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Configura push proativo (almoço, jantar, sextou).
+    Uso:
+      /push          → mostra config atual
+      /push off      → desliga todos os pushes proativos
+      /push on       → liga (mantém horários)
+      /push almoco 13:30  → muda horário do almoço
+      /push jantar 20:30  → muda horário do jantar
+    """
+    if not _guard(update): return
+    user_id = update.effective_user.id
+    p = await db.get_profile(user_id) or {}
+    args = context.args
+
+    if not args:
+        enabled = p.get("push_enabled", True)
+        lh = p.get("push_lunch_hour", 13); lm = p.get("push_lunch_minute", 0) or 0
+        dh = p.get("push_dinner_hour", 20); dm = p.get("push_dinner_minute", 0) or 0
+        status = "✅ ligados" if enabled else "❌ desligados"
+        await update.message.reply_text(
+            f"Pushes proativos: {status}\n"
+            f"  🍽 Almoço: <b>{lh:02d}:{lm:02d}</b>\n"
+            f"  🌙 Jantar: <b>{dh:02d}:{dm:02d}</b>\n"
+            f"  📊 Sextou: sexta 19:00\n\n"
+            "Uso:\n"
+            "  <code>/push off</code> — desliga\n"
+            "  <code>/push on</code>  — liga\n"
+            "  <code>/push almoco 13:30</code>\n"
+            "  <code>/push jantar 20:30</code>",
+            parse_mode=ParseMode.HTML, reply_markup=MAIN_KB,
+        )
+        return
+
+    sub = args[0].lower()
+    if sub == "off":
+        await db.upsert_profile_field(user_id, "push_enabled", False)
+        await update.message.reply_text("Pushes desligados.")
+        return
+    if sub == "on":
+        await db.upsert_profile_field(user_id, "push_enabled", True)
+        await update.message.reply_text("Pushes ligados.")
+        return
+    if sub in ("almoco", "almoço", "jantar") and len(args) >= 2:
+        parsed = _parse_hhmm(args[1])
+        if not parsed:
+            await update.message.reply_text("Formato inválido. Ex: /push almoco 13:30")
+            return
+        h, m = parsed
+        if sub == "jantar":
+            await db.upsert_profile_field(user_id, "push_dinner_hour", h)
+            await db.upsert_profile_field(user_id, "push_dinner_minute", m)
+            label = "Jantar"
+        else:
+            await db.upsert_profile_field(user_id, "push_lunch_hour", h)
+            await db.upsert_profile_field(user_id, "push_lunch_minute", m)
+            label = "Almoço"
+        await db.upsert_profile_field(user_id, "push_enabled", True)
+        await update.message.reply_text(f"{label}: {h:02d}:{m:02d} ✅")
+        return
+
+    await update.message.reply_text(
+        "Uso: /push [off|on|almoco HH:MM|jantar HH:MM]"
+    )
 
 
 async def cmd_lembrete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -717,6 +783,141 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # Lifecycle
 # ============================================================
 
+async def _should_skip_nudge_due_to_recent_meal(user_id: int, since_minutes: int) -> bool:
+    """True se houve refeição logada nos últimos N minutos — não precisa cutucar."""
+    from datetime import datetime as _dt
+    last = await db.last_meal_at(user_id)
+    if not last:
+        return False
+    delta = _dt.now(timezone.utc) - last
+    return delta.total_seconds() < since_minutes * 60
+
+
+async def _push_nudge_generic(context, kind: str, hour_col_h: str, hour_col_m: str,
+                              last_date_col: str, skip_window_min: int,
+                              message_fn) -> None:
+    """Helper genérico pra disparo de lunch/dinner nudge."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+    from agent import runtime as agent_rt
+
+    try:
+        users = await db.users_due_for_push()
+    except Exception:
+        log.exception("falha buscando users pra push %s", kind)
+        return
+
+    now_utc = _dt.now(timezone.utc)
+    for u in users:
+        tz_name = u.get("timezone") or "America/Sao_Paulo"
+        try:
+            local = now_utc.astimezone(ZoneInfo(tz_name))
+        except Exception:
+            continue
+        hour = u.get(hour_col_h)
+        minute = u.get(hour_col_m) or 0
+        if hour is None or local.hour != hour or local.minute != minute:
+            continue
+        today_local = local.date()
+        if u.get(last_date_col) == today_local:
+            continue
+        # Skip se logou refeição recente
+        if await _should_skip_nudge_due_to_recent_meal(u["user_id"], skip_window_min):
+            await db.mark_push_sent(u["user_id"], kind, today_local)  # marca pra não ficar checando
+            continue
+        try:
+            text = message_fn()
+            await context.bot.send_message(chat_id=u["user_id"], text=text)
+            await db.mark_push_sent(u["user_id"], kind, today_local)
+            # Salva no histórico da conversa do agente — assim se user responder com
+            # foto/texto, o agente tem o contexto certo
+            try:
+                conv = await agent_rt.get_or_create_conversation(u["user_id"])
+                await agent_rt.add_message(conv["id"], "assistant", content=text)
+            except Exception:
+                log.exception("falha salvando nudge no histórico")
+            log.info("push %s enviado pra user_id=%s", kind, u["user_id"])
+        except Exception:
+            log.exception("falha enviando push %s pra user_id=%s", kind, u.get("user_id"))
+
+
+async def _lunch_nudge_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    from agent.nudges import pick_lunch
+    await _push_nudge_generic(
+        context, kind="lunch",
+        hour_col_h="push_lunch_hour", hour_col_m="push_lunch_minute",
+        last_date_col="push_lunch_last_date",
+        skip_window_min=120,  # 2h
+        message_fn=pick_lunch,
+    )
+
+
+async def _dinner_nudge_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    from agent.nudges import pick_dinner
+    await _push_nudge_generic(
+        context, kind="dinner",
+        hour_col_h="push_dinner_hour", hour_col_m="push_dinner_minute",
+        last_date_col="push_dinner_last_date",
+        skip_window_min=180,  # 3h
+        message_fn=pick_dinner,
+    )
+
+
+async def _friday_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sexta às 19h local, manda resumo + gráfico da semana."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+    from agent.nudges import pick_friday
+    from agent.tools import _build_daily_chart  # noqa — usa pra reaproveitar
+    from agent import charts
+    import io as _io
+
+    try:
+        users = await db.users_due_for_push()
+    except Exception:
+        log.exception("falha buscando users pra friday")
+        return
+
+    now_utc = _dt.now(timezone.utc)
+    for u in users:
+        tz_name = u.get("timezone") or "America/Sao_Paulo"
+        try:
+            local = now_utc.astimezone(ZoneInfo(tz_name))
+        except Exception:
+            continue
+        # Sexta = weekday 4; 19:00 local
+        if local.weekday() != 4 or local.hour != 19 or local.minute != 0:
+            continue
+        today_local = local.date()
+        if u.get("push_friday_last_date") == today_local:
+            continue
+        try:
+            intro = pick_friday()
+            summary = await db.period_summary(u["user_id"], 7)
+            profile = await db.get_profile(u["user_id"]) or {}
+            goal = profile.get("daily_kcal")
+            totals = summary["totals"]
+            avgs = summary["averages"]
+            text = (
+                f"{intro}\n\n"
+                f"📊 7 dias:\n"
+                f"• Total: {totals['intake_kcal']:.0f} kcal consumidas, "
+                f"{totals['burned_kcal']} queimadas\n"
+                f"• Média: {avgs['intake_per_day']:.0f} kcal/dia"
+                + (f" (meta {goal})" if goal else "") + "\n\n"
+                "Bora pra próxima semana 💪"
+            )
+            await context.bot.send_message(chat_id=u["user_id"], text=text)
+            # Gráfico
+            png = charts.daily_intake_vs_goal(summary["per_day"], goal_kcal=goal,
+                                              title="Sua semana")
+            await context.bot.send_photo(chat_id=u["user_id"], photo=_io.BytesIO(png))
+            await db.mark_push_sent(u["user_id"], "friday", today_local)
+            log.info("sextou enviado pra user_id=%s", u["user_id"])
+        except Exception:
+            log.exception("falha enviando friday summary user_id=%s", u.get("user_id"))
+
+
 async def _weigh_in_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Job que roda a cada minuto. Dispara lembretes pra users no horário local certo."""
     from datetime import datetime as _dt
@@ -775,12 +976,12 @@ async def _post_init(app: Application) -> None:
         log.warning("Banco vazio! Rode: python import_taco.py")
     else:
         log.info("DB pronto. %s alimentos carregados.", n)
-    # Job de lembrete: roda no minuto 0 de cada hora
-    from datetime import time as _time
-    app.job_queue.run_repeating(
-        _weigh_in_job, interval=60, first=10, name="weigh_in_reminder"
-    )
-    log.info("Lembrete de pesagem agendado (verifica a cada minuto).")
+    # Jobs agendados — todos checam a cada minuto e disparam conforme hora local do user
+    app.job_queue.run_repeating(_weigh_in_job, interval=60, first=10, name="weigh_in_reminder")
+    app.job_queue.run_repeating(_lunch_nudge_job, interval=60, first=20, name="lunch_nudge")
+    app.job_queue.run_repeating(_dinner_nudge_job, interval=60, first=30, name="dinner_nudge")
+    app.job_queue.run_repeating(_friday_summary_job, interval=60, first=40, name="friday_summary")
+    log.info("Lembrete de pesagem + 3 nudges agendados (todos checam a cada minuto).")
 
 
 async def _post_shutdown(app: Application) -> None:
@@ -808,6 +1009,7 @@ def main() -> None:
     app.add_handler(CommandHandler("relatorio", cmd_relatorio))
     app.add_handler(CommandHandler("grafico", cmd_grafico))
     app.add_handler(CommandHandler("lembrete", cmd_lembrete))
+    app.add_handler(CommandHandler("push", cmd_push))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
