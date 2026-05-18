@@ -637,19 +637,26 @@ async def _weigh_in_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if u.get("weigh_in_last_date") == today_local:
             continue  # já enviado hoje
 
+        reminder_text = (
+            "☀️ Bom dia! Hora da pesagem.\n\n"
+            "Manda só o número (ex: 101.8) ou foto da balança "
+            "que eu atualizo seu peso e recalculo a meta do dia."
+        )
         try:
             await context.bot.send_message(
                 chat_id=u["user_id"],
-                text=(
-                    "☀️ Bom dia! Hora da pesagem.\n\n"
-                    "Manda só o número (ex: <code>101.8</code>) ou foto da balança "
-                    "que eu atualizo seu peso e recalculo a meta do dia."
-                ),
-                parse_mode=ParseMode.HTML,
+                text=reminder_text,
             )
             await db.mark_reminder_sent(u["user_id"], today_local)
             log.info("lembrete enviado pra user_id=%s (%02d:%02d local)",
                      u["user_id"], hour, minute)
+            # Salva o lembrete no histórico da conversa do agente — assim quando o
+            # user responder com foto/número, o agente tem o contexto pra interpretar.
+            try:
+                conv = await agent.get_or_create_conversation(u["user_id"])
+                await agent.add_message(conv["id"], "assistant", content=reminder_text)
+            except Exception:
+                log.exception("falha salvando lembrete no histórico (não-crítico)")
         except Exception:
             log.exception("falha enviando lembrete user_id=%s", u.get("user_id"))
 
