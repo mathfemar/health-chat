@@ -262,7 +262,15 @@ async def cmd_buscar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_hoje(update: Update, _) -> None:
     if not _guard(update): return
-    meals = await db.list_today(update.effective_user.id)
+    from zoneinfo import ZoneInfo
+    user_id = update.effective_user.id
+    profile = await db.get_profile(user_id) or {}
+    tz_name = profile.get("timezone") or "America/Sao_Paulo"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("America/Sao_Paulo")
+    meals = await db.list_today(user_id)
     if not meals:
         await update.message.reply_text("Nada registrado hoje.")
         return
@@ -271,7 +279,8 @@ async def cmd_hoje(update: Update, _) -> None:
     for m in meals:
         items = m["items"] if isinstance(m["items"], list) else json.loads(m["items"])
         names = ", ".join(i.get("food_name") or i["name_llm"] for i in items[:3])
-        lines.append(f"#{m['id']}  {m['eaten_at'].strftime('%H:%M')}  {_esc(names)}  — {float(m['kcal']):.0f} kcal")
+        local_time = m["eaten_at"].astimezone(tz).strftime("%H:%M")
+        lines.append(f"#{m['id']}  {local_time}  {_esc(names)}  — {float(m['kcal']):.0f} kcal")
         tot_k += float(m["kcal"]); tot_p += float(m["protein_g"])
         tot_c += float(m["carbs_g"]); tot_f += float(m["fat_g"])
     await update.message.reply_text(
@@ -613,7 +622,8 @@ async def _weigh_in_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     now_utc = _dt.now(timezone.utc)
     for u in users:
-        tz_name = u.get("weigh_in_tz") or "America/Sao_Paulo"
+        # timezone canônico do user (fallback weigh_in_tz legado)
+        tz_name = u.get("timezone") or u.get("weigh_in_tz") or "America/Sao_Paulo"
         try:
             local = now_utc.astimezone(ZoneInfo(tz_name))
         except Exception:

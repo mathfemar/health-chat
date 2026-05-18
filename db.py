@@ -31,6 +31,9 @@ async def _apply_lightweight_migrations() -> None:
     Não substitui import_taco.py (que recria do zero) — só adiciona colunas novas."""
     migrations = [
         "alter table user_profiles add column if not exists weigh_in_minute int default 0",
+        "alter table user_profiles add column if not exists timezone text default 'America/Sao_Paulo'",
+        # Garantir que perfis existentes sem tz pegam o default
+        "update user_profiles set timezone='America/Sao_Paulo' where timezone is null",
     ]
     async with _pool.acquire() as conn:
         for sql in migrations:
@@ -145,8 +148,8 @@ async def summary_since(user_id: int, since: datetime) -> dict:
 
 
 async def list_today(user_id: int) -> list[dict]:
-    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    start = start - timedelta(hours=3)  # aproxima BRT
+    tz = await _user_tz(user_id)
+    start = _day_start_utc(tz)
     async with pool().acquire() as conn:
         rows = await conn.fetch(
             """
@@ -212,6 +215,7 @@ async def upsert_profile_field(user_id: int, field: str, value) -> None:
         "name", "sex", "birth_date", "height_cm", "current_weight_kg",
         "target_weight_kg", "activity_level", "weekly_rate_kg", "eatback_pct",
         "daily_kcal", "daily_protein_g", "preferences",
+        "timezone",
         "weigh_in_enabled", "weigh_in_hour", "weigh_in_minute",
         "weigh_in_tz", "weigh_in_last_date",
     }
@@ -267,7 +271,9 @@ async def users_due_for_weigh_in_reminder() -> list[dict]:
     async with pool().acquire() as conn:
         rows = await conn.fetch(
             """
-            select user_id, weigh_in_hour, weigh_in_minute, weigh_in_tz, weigh_in_last_date
+            select user_id, weigh_in_hour, weigh_in_minute,
+                   coalesce(timezone, weigh_in_tz, 'America/Sao_Paulo') as timezone,
+                   weigh_in_last_date
             from user_profiles
             where weigh_in_enabled = true and weigh_in_hour is not null
             """
@@ -306,13 +312,31 @@ async def insert_exercise(user_id: int, activity: str, kcal_burned: int,
     return row["id"]
 
 
-def _br_day_start_utc():
-    """Início do dia em BRT (UTC-3), retornado em UTC. Aproxima sem zoneinfo."""
-    now = datetime.now(timezone.utc)
-    return now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=3)
+async def _user_tz(user_id: int) -> str:
+    """Retorna tz IANA do user (default America/Sao_Paulo)."""
+    async with pool().acquire() as conn:
+        tz = await conn.fetchval(
+            "select coalesce(timezone, 'America/Sao_Paulo') from user_profiles where user_id=$1",
+            user_id,
+        )
+    return tz or "America/Sao_Paulo"
+
+
+def _day_start_utc(tz_name: str) -> datetime:
+    """Início do dia local do user, retornado como datetime UTC."""
+    from zoneinfo import ZoneInfo
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("America/Sao_Paulo")
+    now_local = datetime.now(tz)
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_local.astimezone(timezone.utc)
 
 
 async def list_exercises_today(user_id: int) -> list[dict]:
+    tz = await _user_tz(user_id)
+    start = _day_start_utc(tz)
     async with pool().acquire() as conn:
         rows = await conn.fetch(
             """
@@ -320,12 +344,14 @@ async def list_exercises_today(user_id: int) -> list[dict]:
             from exercises where user_id=$1 and done_at >= $2
             order by done_at
             """,
-            user_id, _br_day_start_utc(),
+            user_id, start,
         )
     return [dict(r) for r in rows]
 
 
 async def sum_today_meals(user_id: int) -> dict:
+    tz = await _user_tz(user_id)
+    start = _day_start_utc(tz)
     async with pool().acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -335,45 +361,57 @@ async def sum_today_meals(user_id: int) -> dict:
                    coalesce(sum(fat_g), 0) as fat_g
             from meals where user_id=$1 and eaten_at >= $2
             """,
-            user_id, _br_day_start_utc(),
+            user_id, start,
         )
     return {k: float(v) for k, v in dict(row).items()}
 
 
 async def sum_today_exercises(user_id: int) -> int:
+    tz = await _user_tz(user_id)
+    start = _day_start_utc(tz)
     async with pool().acquire() as conn:
         v = await conn.fetchval(
             "select coalesce(sum(kcal_burned), 0) from exercises where user_id=$1 and done_at >= $2",
-            user_id, _br_day_start_utc(),
+            user_id, start,
         )
     return int(v or 0)
 
 
 async def period_summary(user_id: int, days: int) -> dict:
-    """Resumo dia-a-dia dos últimos N dias (em BRT)."""
-    end = datetime.now(timezone.utc)
-    start = (end.replace(hour=0, minute=0, second=0, microsecond=0)
-             - timedelta(hours=3, days=days-1))
+    """Resumo dia-a-dia dos últimos N dias (no tz local do user)."""
+    from zoneinfo import ZoneInfo
+    tz_name = await _user_tz(user_id)
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("America/Sao_Paulo")
+        tz_name = "America/Sao_Paulo"
+
+    today_local = datetime.now(tz).date()
+    start_local_date = today_local - timedelta(days=days - 1)
+    start_local_dt = datetime.combine(start_local_date,
+                                       datetime.min.time(), tzinfo=tz)
+    start_utc = start_local_dt.astimezone(timezone.utc)
 
     async with pool().acquire() as conn:
         meal_rows = await conn.fetch(
-            """
-            select date(eaten_at at time zone 'America/Sao_Paulo') as d,
+            f"""
+            select date(eaten_at at time zone '{tz_name}') as d,
                    sum(kcal) as kcal,
                    sum(protein_g) as protein_g
             from meals where user_id=$1 and eaten_at >= $2
             group by 1 order by 1
             """,
-            user_id, start,
+            user_id, start_utc,
         )
         ex_rows = await conn.fetch(
-            """
-            select date(done_at at time zone 'America/Sao_Paulo') as d,
+            f"""
+            select date(done_at at time zone '{tz_name}') as d,
                    sum(kcal_burned) as kcal
             from exercises where user_id=$1 and done_at >= $2
             group by 1 order by 1
             """,
-            user_id, start,
+            user_id, start_utc,
         )
 
     by_day_intake = {r["d"]: float(r["kcal"] or 0) for r in meal_rows}
@@ -381,9 +419,8 @@ async def period_summary(user_id: int, days: int) -> dict:
     by_day_burned = {r["d"]: int(r["kcal"] or 0) for r in ex_rows}
 
     per_day = []
-    today_br = (datetime.now(timezone.utc) - timedelta(hours=3)).date()
     for offset in range(days - 1, -1, -1):
-        d = today_br - timedelta(days=offset)
+        d = today_local - timedelta(days=offset)
         intake = by_day_intake.get(d, 0.0)
         burned = by_day_burned.get(d, 0)
         per_day.append({
