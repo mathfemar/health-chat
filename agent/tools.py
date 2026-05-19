@@ -3,7 +3,8 @@
 Cada tool retorna dict serializável (JSON). ctx é passado pelo runtime e contém:
   ctx['user_id']       : int
   ctx['conv_id']       : int  (id da conversa atual)
-  ctx['bot']           : objeto telegram.Bot pra baixar fotos
+  ctx['download_photo']: async callable (photo_ref: str) -> bytes | None
+                         injetado pelo adapter (Telegram ou Twilio/WhatsApp)
   ctx['vision_model']  : slug do modelo de visão
 """
 import io
@@ -1123,20 +1124,18 @@ async def remember(ctx: dict, key: str, value: str) -> dict:
 # Helpers
 # --------------------------------------------------------------
 async def _download_photo(ctx: dict, photo_id: str) -> bytes | None:
-    """Baixa foto. Se photo_id passado pelo LLM falhar (modelo corrompe IDs longos),
+    """Baixa foto via callable injetado pelo adapter (Telegram/WhatsApp).
+    Se photo_id passado pelo LLM falhar (modelo corrompe IDs longos),
     tenta o latest_photo_id que o runtime injetou no ctx."""
-    bot = ctx.get("bot")
-    if not bot:
+    downloader = ctx.get("download_photo")
+    if not downloader:
         return None
 
     async def _try(pid: str) -> bytes | None:
         try:
-            f = await bot.get_file(pid)
-            buf = io.BytesIO()
-            await f.download_to_memory(out=buf)
-            return buf.getvalue()
+            return await downloader(pid)
         except Exception as e:
-            log.warning("get_file falhou pra %s: %s", pid[:30] + "...", e)
+            log.warning("download_photo falhou pra %s: %s", pid[:30] + "...", e)
             return None
 
     # 1ª tentativa: o que o LLM passou
