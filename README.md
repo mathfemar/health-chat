@@ -169,12 +169,69 @@ notepad .env       # preenche os campos abaixo
 
 # Cria schema + popula 590 alimentos do TACO
 python import_taco.py
+```
 
-# Sobe o bot
+---
+
+## Como rodar
+
+Você tem **3 modos** de execução. Use o que se encaixar no que você quer testar.
+
+### Modo 1 — Só Telegram (mais simples)
+
+```powershell
 python bot.py
 ```
 
-No Telegram, manda `/start` pro seu bot e depois `"quero definir minha meta"` pra começar o onboarding conversacional.
+Requer `TELEGRAM_BOT_TOKEN` no `.env`. Se as envs do Twilio estiverem **vazias**, o adapter WhatsApp não sobe e o bot roda só no Telegram.
+
+No Telegram, manda `/start` pro seu bot e depois `"quero definir minha meta"` pra começar o onboarding.
+
+### Modo 2 — Só WhatsApp (standalone)
+
+Útil pra testar o WhatsApp isoladamente, ou rodar sem precisar de bot Telegram.
+
+```powershell
+python -m uvicorn whatsapp:app --host 0.0.0.0 --port 8000
+```
+
+Requer as 5 envs do Twilio no `.env` (ver seção [WhatsApp (Twilio)](#whatsapp-twilio--opcional-roda-em-paralelo-ao-telegram) abaixo). Não precisa de `TELEGRAM_BOT_TOKEN`.
+
+> **Dica de debug**: pra subir o servidor antes de ter o túnel pronto, põe `TWILIO_VALIDATE=0` no `.env` (desabilita validação de assinatura). Depois muda pra `1`.
+
+### Modo 3 — Telegram + WhatsApp juntos (produção)
+
+```powershell
+python bot.py
+```
+
+Quando as envs do Twilio estão **preenchidas**, o `bot.py` sobe automaticamente também o servidor FastAPI do WhatsApp em paralelo (mesma process). Os dois canais compartilham banco/histórico/perfil.
+
+Você vai ver nos logs:
+```
+Telegram polling iniciado.
+WhatsApp adapter iniciando em 0.0.0.0:8000
+```
+
+### Pré-requisito comum: túnel pra Twilio (modos 2 e 3)
+
+Twilio precisa alcançar seu PC via URL pública. Em **outra janela do PowerShell**:
+
+```powershell
+# Instala (uma vez só)
+winget install --id Cloudflare.cloudflared
+
+# Sobe o túnel apontando pra porta 8000
+cloudflared tunnel --url http://localhost:8000
+```
+
+Copia a URL `https://xxx-yyy.trycloudflare.com` que aparecer, cola em `PUBLIC_BASE_URL` no `.env`, e no Twilio Console (**Messaging → Sandbox Settings → When a message comes in**) cola `<URL>/twilio/webhook` POST.
+
+> A URL muda toda vez que você reinicia o `cloudflared`. Pra rodar 24/7, criar um [túnel nomeado](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) (grátis, URL fixa).
+
+### Parando o bot
+
+`Ctrl+C` na janela do bot/uvicorn. O cloudflared é separado, também `Ctrl+C` na janela dele.
 
 ---
 
@@ -196,6 +253,71 @@ OPENROUTER_RERANK_MODEL=google/gemma-2-9b-it:free         # desempate de matchin
 # Postgres (Supabase)
 DATABASE_URL=postgresql://postgres.xxx:SENHA@aws-0-sa-east-1.pooler.supabase.com:6543/postgres
 ```
+
+---
+
+## WhatsApp (Twilio) — opcional, roda em paralelo ao Telegram
+
+O bot continua falando Telegram normalmente. Se você preencher as creds do Twilio no `.env`, sobe **também** um servidor FastAPI que recebe mensagens via webhook do Twilio — mesmo agente, mesmo banco, mesmo histórico (no modo single-user, seu telefone é mapeado pro seu `ALLOWED_USER_ID` do Telegram).
+
+### 1. Cria conta Twilio
+1. [twilio.com/try-twilio](https://www.twilio.com/try-twilio) — conta grátis ($15 de trial).
+2. No console (canto superior direito): **Account SID** e **Auth Token**. Copia.
+
+### 2. Ativa o WhatsApp sandbox (rápido, sem aprovação)
+1. Console Twilio → **Messaging → Try it out → Send a WhatsApp message**.
+2. Mostra o número do sandbox (`+1 415 523 8886`) e um código `join xxxxx`.
+3. No seu WhatsApp, manda `join xxxxx` pra esse número. Pronto, seu telefone está ligado ao sandbox.
+4. `TWILIO_WHATSAPP_FROM=whatsapp:+14155238886` no `.env`.
+
+> **Limitação do sandbox**: depois de 24h sem você mandar mensagem, o Twilio só deixa o bot te responder se você mandar `join xxxxx` de novo. Pra produção (sem essa limitação), tem que comprar um número e passar pela aprovação do WhatsApp Business.
+
+### 3. Expõe o servidor pra internet
+
+Seu PC em casa não tem IP público, então precisa de um túnel. Recomendo **Cloudflare Tunnel** (grátis, estável, melhor que ngrok pra rodar 24/7):
+
+```powershell
+# Instala cloudflared (Windows)
+winget install --id Cloudflare.cloudflared
+
+# Sobe um túnel apontando pra porta 8000 (sem precisar de conta)
+cloudflared tunnel --url http://localhost:8000
+```
+
+A saída mostra algo tipo `https://xxx-yyy.trycloudflare.com`. Copia.
+
+> **Alternativa**: `ngrok http 8000` se preferir.
+
+### 4. Preenche o `.env`
+
+```env
+TWILIO_ACCOUNT_SID=ACxxxxx
+TWILIO_AUTH_TOKEN=xxxxx
+TWILIO_WHATSAPP_FROM=whatsapp:+14155238886
+WHATSAPP_LINK_PHONE=+5511987654321        # seu telefone (E.164)
+PUBLIC_BASE_URL=https://xxx-yyy.trycloudflare.com
+```
+
+### 5. Configura o webhook no Twilio
+Console Twilio → **Messaging → Settings → WhatsApp sandbox settings**:
+- "When a message comes in" → `https://xxx-yyy.trycloudflare.com/twilio/webhook` (POST)
+- Salva.
+
+### 6. Sobe o bot
+```powershell
+python bot.py
+```
+Logs vão mostrar `Telegram polling iniciado` **e** `WhatsApp adapter iniciando em 0.0.0.0:8000`. Manda uma mensagem no WhatsApp pro número do sandbox — deve responder igual ao Telegram, com o mesmo histórico de conversa.
+
+### Como mídia funciona
+- **Foto recebida**: Twilio manda `MediaUrl0` na webhook → adapter baixa via basic auth → manda pra Vision LLM exatamente como faz no Telegram.
+- **Foto enviada** (gráficos): adapter guarda em cache em memória e expõe em `GET /media/<token>` — Twilio busca e entrega no WhatsApp. Cache expira em 10min.
+
+### Lembrete de pesagem nos dois canais
+Com WhatsApp habilitado, o lembrete diário é enviado **tanto no Telegram quanto no WhatsApp** pro mesmo usuário. Em produção (fora do sandbox), conversas iniciadas pelo bot fora da janela de 24h exigem **template aprovado** no WhatsApp Business — se o lembrete começar a falhar, é provavelmente isso.
+
+### Segurança
+Por default o adapter valida `X-Twilio-Signature` em todo POST (descarta requests forjados). Se estiver debugando sem URL pública, pode setar `TWILIO_VALIDATE=0` temporariamente.
 
 ---
 
@@ -402,7 +524,7 @@ Pisos: 1500 kcal (M) / 1200 kcal (F).
 
 ### Longo prazo
 - [ ] Multi-user com auth (Supabase Auth)
-- [ ] Versão WhatsApp (mesma lógica, gateway diferente)
+- [x] Versão WhatsApp via Twilio (roda em paralelo ao Telegram)
 - [ ] Dashboard web (Next.js consumindo os mesmos endpoints)
 
 ---

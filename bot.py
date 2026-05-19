@@ -22,6 +22,7 @@ from telegram.ext import (
 )
 
 import calculator
+import commands
 import db
 import llm
 import matcher
@@ -209,54 +210,49 @@ def _meal_keyboard(meal_id: int, items: list[dict]) -> InlineKeyboardMarkup:
 
 
 # ============================================================
-# Comandos
+# Comandos — lógica em commands.py (agnóstica de canal)
 # ============================================================
 
-COMMANDS_HELP = """\
-🎯 <b>Botões fixos embaixo</b> — atalhos pras ações comuns:
-  🍽 Refeição · ⚖️ Peso · 🏃 Treino · 📊 Hoje · 🎯 Meta · ⚙️ Mais
+def _suggestions_to_inline_kb(suggestions: list[commands.Suggestion]) -> InlineKeyboardMarkup:
+    """Converte Suggestion[] em InlineKeyboardMarkup (botões clicáveis no Telegram).
+    Cada botão dispara on_callback com data 'cmd:<command>'."""
+    rows = [[InlineKeyboardButton(s.label, callback_data=f"cmd:{s.command}")]
+            for s in suggestions]
+    return InlineKeyboardMarkup(rows)
 
-💬 <b>Ou escreva livre</b>: 'comi 100g arroz e bife', 'como tá meu dia?',
-'foto do cardápio, quero algo com carne', '101.8' (peso direto).
 
-📷 <b>Mande foto direta</b> — identifico prato, cardápio, relógio ou balança.
-
-<b>Todos os comandos (também acessíveis via botões):</b>
-/start /ajuda — esta mensagem
-/perfil — perfil e meta
-/hoje /semana — totais do período
-/grafico — anel kcal + macros + refeições
-/relatorio [semana|mes|N] — gráfico do período
-/lembrete [off|on|HH:MM] — lembrete diário de pesagem (ex: 6:30, 7, 06:35)
-/apagar — remove última refeição
-/buscar &lt;termo&gt; — busca alimento
-/modelo [slug] — troca modelo de visão
-/reset — nova conversa
-
-<b>Marcadores:</b>
-✅ TACO   🌿 Vitat   🟡 estimativa   ❌ sem dados
-"""
+async def _send_result(update: Update, r: commands.CommandResult,
+                       reply_markup=None) -> None:
+    """Envia CommandResult: texto HTML + foto + sugestões (inline keyboard)."""
+    # Se há sugestões e o caller não definiu reply_markup, usa as sugestões.
+    if r.suggestions and reply_markup is None:
+        reply_markup = _suggestions_to_inline_kb(r.suggestions)
+    if r.text:
+        try:
+            await update.message.reply_text(
+                r.text, parse_mode=ParseMode.HTML, reply_markup=reply_markup,
+            )
+        except Exception:
+            await update.message.reply_text(r.text, reply_markup=reply_markup)
+    if r.png:
+        await update.message.reply_photo(photo=io.BytesIO(r.png))
 
 
 async def cmd_start(update: Update, _) -> None:
     u = update.effective_user
     log.info("start from user_id=%s username=%s", u.id, u.username)
-    n = await db.count_foods()
-    await update.message.reply_text(
-        f"Oi! Seu user_id é <code>{u.id}</code>. Base nutricional: {n} alimentos.\n\n"
-        f"{COMMANDS_HELP}\n"
-        "👉 Sem perfil ainda? Diga <i>'quero definir minha meta'</i> pra começar o onboarding.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=MAIN_KB,
-    )
+    r = await commands.cmd_start(u.id, [])
+    await _send_result(update, r, reply_markup=MAIN_KB)
 
 
 async def cmd_ajuda(update: Update, _) -> None:
     if not _guard(update): return
-    await update.message.reply_text(COMMANDS_HELP, parse_mode=ParseMode.HTML, reply_markup=MAIN_KB)
+    r = await commands.cmd_ajuda(update.effective_user.id, [])
+    await _send_result(update, r, reply_markup=MAIN_KB)
 
 
 async def cmd_modelo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Telegram-only: aceita escrita (atualiza bot_data em memória)."""
     if not _guard(update): return
     if context.args:
         new = " ".join(context.args).strip()
@@ -271,247 +267,121 @@ async def cmd_modelo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_buscar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _guard(update): return
-    if not context.args:
-        await update.message.reply_text("Uso: /buscar arroz integral")
-        return
-    name = " ".join(context.args)
-    m = await matcher.match_one(name)
-    if not m.alternatives:
-        await update.message.reply_text("Nada encontrado.")
-        return
-    lines = [f"Para '{_esc(name)}':"]
-    for a in m.alternatives[:5]:
-        marker = " ⭐" if a["id"] == m.food_id else ""
-        lines.append(f"  • {_esc(a['name'])} (sim {a['score']:.2f}){marker}")
-    lines.append(f"\nMétodo: {m.method}")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    r = await commands.cmd_buscar(update.effective_user.id, list(context.args or []))
+    await _send_result(update, r)
 
 
 async def cmd_hoje(update: Update, _) -> None:
     if not _guard(update): return
-    from zoneinfo import ZoneInfo
-    user_id = update.effective_user.id
-    profile = await db.get_profile(user_id) or {}
-    tz_name = profile.get("timezone") or "America/Sao_Paulo"
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = ZoneInfo("America/Sao_Paulo")
-    meals = await db.list_today(user_id)
-    if not meals:
-        await update.message.reply_text("Nada registrado hoje.")
-        return
-    lines = []
-    tot_k = tot_p = tot_c = tot_f = 0.0
-    for m in meals:
-        items = m["items"] if isinstance(m["items"], list) else json.loads(m["items"])
-        names = ", ".join(i.get("food_name") or i["name_llm"] for i in items[:3])
-        local_time = m["eaten_at"].astimezone(tz).strftime("%H:%M")
-        lines.append(f"#{m['id']}  {local_time}  {_esc(names)}  — {float(m['kcal']):.0f} kcal")
-        tot_k += float(m["kcal"]); tot_p += float(m["protein_g"])
-        tot_c += float(m["carbs_g"]); tot_f += float(m["fat_g"])
-    await update.message.reply_text(
-        f"<b>Hoje</b> ({len(meals)} refeições)\n" + "\n".join(lines) +
-        f"\n\n🔥 <b>{tot_k:.0f} kcal</b>\nP {tot_p:.0f}  C {tot_c:.0f}  G {tot_f:.0f}",
-        parse_mode=ParseMode.HTML,
-    )
+    r = await commands.cmd_hoje(update.effective_user.id, [])
+    await _send_result(update, r)
 
 
 async def cmd_semana(update: Update, _) -> None:
     if not _guard(update): return
-    from datetime import datetime, timedelta, timezone
-    s = await db.summary_since(update.effective_user.id, datetime.now(timezone.utc) - timedelta(days=7))
-    if not s["n"]:
-        await update.message.reply_text("Sem refeições nos últimos 7 dias.")
-        return
-    await update.message.reply_text(
-        f"<b>Últimos 7 dias</b> — {s['n']} refeições\n"
-        f"Total: {float(s['kcal']):.0f} kcal\n"
-        f"Média/dia: {float(s['kcal'])/7:.0f} kcal\n"
-        f"P {float(s['protein_g']):.0f}  C {float(s['carbs_g']):.0f}  G {float(s['fat_g']):.0f}",
-        parse_mode=ParseMode.HTML,
-    )
+    r = await commands.cmd_semana(update.effective_user.id, [])
+    await _send_result(update, r)
 
 
 async def cmd_apagar(update: Update, _) -> None:
     if not _guard(update): return
-    d = await db.delete_last(update.effective_user.id)
-    await update.message.reply_text(f"Removido #{d}." if d else "Nada pra apagar.")
+    r = await commands.cmd_apagar(update.effective_user.id, [])
+    await _send_result(update, r)
 
 
 async def cmd_grafico(update: Update, _) -> None:
-    """Gera e envia o gráfico do dia direto, sem passar pelo agente."""
     if not _guard(update): return
-    from agent.tools import _build_daily_chart
-    user_id = update.effective_user.id
-    try:
-        png = await _build_daily_chart(user_id)
-    except Exception as e:
-        log.exception("erro gerando gráfico")
-        await update.message.reply_text(f"Falha gerando gráfico: {e}")
-        return
-    await update.message.reply_photo(photo=io.BytesIO(png))
+    r = await commands.cmd_grafico(update.effective_user.id, [])
+    await _send_result(update, r)
 
 
-def _parse_hhmm(s: str) -> tuple[int, int] | None:
-    """Aceita: '6', '06', '6:30', '06:30', '6.30', '630', '0630'.
-    Retorna (hour, minute) ou None."""
-    s = s.strip().replace(".", ":").replace("h", ":")
-    if ":" in s:
-        try:
-            h_s, m_s = s.split(":", 1)
-            h, m = int(h_s), int(m_s)
-        except ValueError:
-            return None
-    elif s.isdigit():
-        if len(s) <= 2:
-            h, m = int(s), 0
-        elif len(s) in (3, 4):
-            h, m = int(s[:-2]), int(s[-2:])
-        else:
-            return None
-    else:
-        return None
-    if not (0 <= h <= 23 and 0 <= m <= 59):
-        return None
-    return h, m
-
-
-async def cmd_lembrete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Configurar lembrete diário de pesagem.
+async def cmd_push(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Configura push proativo (almoço, jantar, sextou).
     Uso:
-      /lembrete            → mostra atual
-      /lembrete off        → desliga
-      /lembrete on         → liga (mantém horário atual)
-      /lembrete 7          → muda pra 07:00
-      /lembrete 6:30       → muda pra 06:30
-      /lembrete 06:35      → muda pra 06:35
+      /push          → mostra config atual
+      /push off      → desliga todos os pushes proativos
+      /push on       → liga (mantém horários)
+      /push almoco 13:30  → muda horário do almoço
+      /push jantar 20:30  → muda horário do jantar
     """
     if not _guard(update): return
     user_id = update.effective_user.id
-    args = context.args
     p = await db.get_profile(user_id) or {}
+    args = context.args
 
     if not args:
-        enabled = p.get("weigh_in_enabled", True)
-        hour = p.get("weigh_in_hour", 6) or 6
-        minute = p.get("weigh_in_minute", 0) or 0
-        status = "✅ ligado" if enabled else "❌ desligado"
+        enabled = p.get("push_enabled", True)
+        lh = p.get("push_lunch_hour", 13); lm = p.get("push_lunch_minute", 0) or 0
+        dh = p.get("push_dinner_hour", 20); dm = p.get("push_dinner_minute", 0) or 0
+        status = "✅ ligados" if enabled else "❌ desligados"
         await update.message.reply_text(
-            f"Lembrete de pesagem: {status} às <b>{hour:02d}:{minute:02d}</b> "
-            f"({p.get('weigh_in_tz','America/Sao_Paulo')})\n\n"
+            f"Pushes proativos: {status}\n"
+            f"  🍽 Almoço: <b>{lh:02d}:{lm:02d}</b>\n"
+            f"  🌙 Jantar: <b>{dh:02d}:{dm:02d}</b>\n"
+            f"  📊 Sextou: sexta 19:00\n\n"
             "Uso:\n"
-            "  <code>/lembrete off</code>  — desliga\n"
-            "  <code>/lembrete on</code>   — liga\n"
-            "  <code>/lembrete 7</code>    — 07:00\n"
-            "  <code>/lembrete 6:30</code> — 06:30\n"
-            "  <code>/lembrete 06:35</code> — 06:35",
-            parse_mode=ParseMode.HTML,
+            "  <code>/push off</code> — desliga\n"
+            "  <code>/push on</code>  — liga\n"
+            "  <code>/push almoco 13:30</code>\n"
+            "  <code>/push jantar 20:30</code>",
+            parse_mode=ParseMode.HTML, reply_markup=MAIN_KB,
         )
         return
 
-    arg = args[0].lower()
-    if arg == "off":
-        await db.upsert_profile_field(user_id, "weigh_in_enabled", False)
-        await update.message.reply_text("Lembrete desligado.")
+    sub = args[0].lower()
+    if sub == "off":
+        await db.upsert_profile_field(user_id, "push_enabled", False)
+        await update.message.reply_text("Pushes desligados.")
         return
-    if arg == "on":
-        await db.upsert_profile_field(user_id, "weigh_in_enabled", True)
-        h = p.get("weigh_in_hour", 6) or 6
-        m = p.get("weigh_in_minute", 0) or 0
-        await update.message.reply_text(f"Lembrete ligado às {h:02d}:{m:02d}.")
+    if sub == "on":
+        await db.upsert_profile_field(user_id, "push_enabled", True)
+        await update.message.reply_text("Pushes ligados.")
+        return
+    if sub in ("almoco", "almoço", "jantar") and len(args) >= 2:
+        parsed = _parse_hhmm(args[1])
+        if not parsed:
+            await update.message.reply_text("Formato inválido. Ex: /push almoco 13:30")
+            return
+        h, m = parsed
+        if sub == "jantar":
+            await db.upsert_profile_field(user_id, "push_dinner_hour", h)
+            await db.upsert_profile_field(user_id, "push_dinner_minute", m)
+            label = "Jantar"
+        else:
+            await db.upsert_profile_field(user_id, "push_lunch_hour", h)
+            await db.upsert_profile_field(user_id, "push_lunch_minute", m)
+            label = "Almoço"
+        await db.upsert_profile_field(user_id, "push_enabled", True)
+        await update.message.reply_text(f"{label}: {h:02d}:{m:02d} ✅")
         return
 
-    parsed = _parse_hhmm(arg)
-    if parsed is None:
-        await update.message.reply_text(
-            "Formato inválido. Use:\n"
-            "  /lembrete 7        (07:00)\n"
-            "  /lembrete 6:30     (06:30)\n"
-            "  /lembrete off"
-        )
-        return
+    await update.message.reply_text(
+        "Uso: /push [off|on|almoco HH:MM|jantar HH:MM]"
+    )
 
-    h, m = parsed
-    await db.upsert_profile_field(user_id, "weigh_in_hour", h)
-    await db.upsert_profile_field(user_id, "weigh_in_minute", m)
-    await db.upsert_profile_field(user_id, "weigh_in_enabled", True)
-    await update.message.reply_text(f"Lembrete configurado pra <b>{h:02d}:{m:02d}</b>.",
-                                     parse_mode=ParseMode.HTML)
+
+async def cmd_lembrete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _guard(update): return
+    r = await commands.cmd_lembrete(update.effective_user.id, list(context.args or []))
+    await _send_result(update, r)
 
 
 async def cmd_reset(update: Update, _) -> None:
-    """Fecha a conversa atual com o agente. Próxima msg cria uma nova."""
     if not _guard(update): return
-    await db.close_active_conversation(update.effective_user.id)
-    await update.message.reply_text("Conversa zerada. 🔄 Próxima mensagem começa do zero.")
+    r = await commands.cmd_reset(update.effective_user.id, [])
+    await _send_result(update, r)
 
 
 async def cmd_perfil(update: Update, _) -> None:
-    """Mostra perfil + meta. Onboarding fica com o agente."""
     if not _guard(update): return
-    p = await db.get_profile(update.effective_user.id)
-    if not p:
-        await update.message.reply_text(
-            "Sem perfil ainda. Manda uma mensagem tipo 'quero definir minha meta' "
-            "que eu te conduzo no onboarding."
-        )
-        return
-    missing = [k for k in ("sex", "birth_date", "height_cm", "current_weight_kg",
-                            "target_weight_kg", "activity_level", "weekly_rate_kg")
-               if p.get(k) is None]
-    lines = [
-        f"<b>Perfil</b> de {_esc(p.get('name') or '—')}",
-        f"  Sexo: {_esc(p.get('sex') or '—')}",
-        f"  Nascimento: {_esc(p.get('birth_date') or '—')}",
-        f"  Altura: {p.get('height_cm') or '—'} cm",
-        f"  Peso atual: {p.get('current_weight_kg') or '—'} kg",
-        f"  Peso-alvo: {p.get('target_weight_kg') or '—'} kg",
-        f"  Atividade: {_esc(p.get('activity_level') or '—')}",
-        f"  Ritmo: {p.get('weekly_rate_kg') or '—'} kg/semana",
-        f"  Eat-back: {p.get('eatback_pct') or 100}%",
-    ]
-    if p.get("daily_kcal"):
-        lines.append(f"\n🎯 <b>Meta: {p['daily_kcal']} kcal/dia</b> ({p.get('daily_protein_g')}g proteína)")
-    if missing:
-        lines.append(f"\n⚠️ Faltam: {', '.join(missing)}")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    r = await commands.cmd_perfil(update.effective_user.id, [])
+    await _send_result(update, r)
 
 
 async def cmd_relatorio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Relatório do período + gráfico. Args: 'semana' (7d) ou 'mes' (30d) ou número."""
     if not _guard(update): return
-    arg = (context.args[0].lower() if context.args else "semana")
-    days = 30 if arg in ("mes", "mês", "30") else 7
-    if arg.isdigit():
-        days = max(1, min(90, int(arg)))
-
-    user_id = update.effective_user.id
-    summary = await db.period_summary(user_id, days)
-    p = await db.get_profile(user_id)
-    goal = p.get("daily_kcal") if p else None
-
-    # Texto resumo
-    totals = summary["totals"]
-    avgs = summary["averages"]
-    text = (
-        f"<b>Relatório — últimos {days} dias</b>\n"
-        f"Intake total: {totals['intake_kcal']:.0f} kcal\n"
-        f"Queimado total: {totals['burned_kcal']} kcal\n"
-        f"Net total: {totals['net_kcal']:.0f} kcal\n\n"
-        f"<b>Médias/dia:</b>\n"
-        f"  Intake: {avgs['intake_per_day']:.0f} kcal"
-        + (f" (meta {goal})" if goal else "") + "\n"
-        f"  Queimado: {avgs['burned_per_day']:.0f} kcal\n"
-        f"  Net: {avgs['net_per_day']:.0f} kcal"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-
-    # Gráfico
-    from agent import charts
-    png = charts.daily_intake_vs_goal(summary["per_day"], goal_kcal=goal,
-                                       title=f"Últimos {days} dias")
-    await update.message.reply_photo(photo=io.BytesIO(png))
+    r = await commands.cmd_relatorio(update.effective_user.id, list(context.args or []))
+    await _send_result(update, r)
 
 
 # ============================================================
@@ -612,17 +482,29 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _agent_handle(update, context, text=text, photo_file_id=None)
 
 
+async def _telegram_download_photo(bot, file_id: str) -> bytes | None:
+    """Adapter: baixa foto pelo file_id do Telegram, retorna bytes."""
+    f = await bot.get_file(file_id)
+    buf = io.BytesIO()
+    await f.download_to_memory(out=buf)
+    return buf.getvalue()
+
+
 async def _agent_handle(update: Update, context: ContextTypes.DEFAULT_TYPE,
                         text: str, photo_file_id: str | None) -> None:
     """Rota pro agente conversacional."""
     msg = update.message
     await msg.chat.send_action(ChatAction.TYPING)
+
+    async def _dl(pid: str) -> bytes | None:
+        return await _telegram_download_photo(context.bot, pid)
+
     try:
         reply = await agent.run_turn(
             user_id=update.effective_user.id,
             user_text=text,
             photo_file_id=photo_file_id,
-            bot=context.bot,
+            download_photo=_dl,
             vision_model=_current_model(context),
         )
     except Exception as e:
@@ -654,6 +536,35 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await q.answer()
     data = q.data or ""
     user_id = update.effective_user.id
+
+    # cmd:<slash_command> — dispatch genérico de Suggestion (botão de sugestão)
+    if data.startswith("cmd:"):
+        slash = data[len("cmd:"):].strip()
+        parsed = commands.parse_slash(slash if slash.startswith("/") else f"/{slash}")
+        if not parsed:
+            await q.message.reply_text(f"Comando inválido: {slash}")
+            return
+        cmd_name, args = parsed
+        handler = commands.COMMAND_HANDLERS.get(cmd_name)
+        if not handler:
+            await q.message.reply_text(f"Comando /{cmd_name} não reconhecido.")
+            return
+        try:
+            r = await handler(user_id, args)
+        except Exception as e:
+            log.exception("erro executando suggestion /%s", cmd_name)
+            await q.message.reply_text(f"Erro em /{cmd_name}: {e}")
+            return
+        # Re-usa _send_result-like inline (sem o update.message direto)
+        markup = _suggestions_to_inline_kb(r.suggestions) if r.suggestions else None
+        if r.text:
+            try:
+                await q.message.reply_text(r.text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            except Exception:
+                await q.message.reply_text(r.text, reply_markup=markup)
+        if r.png:
+            await q.message.reply_photo(photo=io.BytesIO(r.png))
+        return
 
     if data.startswith("del:"):
         meal_id = int(data.split(":")[1])
@@ -717,6 +628,141 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # Lifecycle
 # ============================================================
 
+async def _should_skip_nudge_due_to_recent_meal(user_id: int, since_minutes: int) -> bool:
+    """True se houve refeição logada nos últimos N minutos — não precisa cutucar."""
+    from datetime import datetime as _dt
+    last = await db.last_meal_at(user_id)
+    if not last:
+        return False
+    delta = _dt.now(timezone.utc) - last
+    return delta.total_seconds() < since_minutes * 60
+
+
+async def _push_nudge_generic(context, kind: str, hour_col_h: str, hour_col_m: str,
+                              last_date_col: str, skip_window_min: int,
+                              message_fn) -> None:
+    """Helper genérico pra disparo de lunch/dinner nudge."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+    from agent import runtime as agent_rt
+
+    try:
+        users = await db.users_due_for_push()
+    except Exception:
+        log.exception("falha buscando users pra push %s", kind)
+        return
+
+    now_utc = _dt.now(timezone.utc)
+    for u in users:
+        tz_name = u.get("timezone") or "America/Sao_Paulo"
+        try:
+            local = now_utc.astimezone(ZoneInfo(tz_name))
+        except Exception:
+            continue
+        hour = u.get(hour_col_h)
+        minute = u.get(hour_col_m) or 0
+        if hour is None or local.hour != hour or local.minute != minute:
+            continue
+        today_local = local.date()
+        if u.get(last_date_col) == today_local:
+            continue
+        # Skip se logou refeição recente
+        if await _should_skip_nudge_due_to_recent_meal(u["user_id"], skip_window_min):
+            await db.mark_push_sent(u["user_id"], kind, today_local)  # marca pra não ficar checando
+            continue
+        try:
+            text = message_fn()
+            await context.bot.send_message(chat_id=u["user_id"], text=text)
+            await db.mark_push_sent(u["user_id"], kind, today_local)
+            # Salva no histórico da conversa do agente — assim se user responder com
+            # foto/texto, o agente tem o contexto certo
+            try:
+                conv = await agent_rt.get_or_create_conversation(u["user_id"])
+                await agent_rt.add_message(conv["id"], "assistant", content=text)
+            except Exception:
+                log.exception("falha salvando nudge no histórico")
+            log.info("push %s enviado pra user_id=%s", kind, u["user_id"])
+        except Exception:
+            log.exception("falha enviando push %s pra user_id=%s", kind, u.get("user_id"))
+
+
+async def _lunch_nudge_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    from agent.nudges import pick_lunch
+    await _push_nudge_generic(
+        context, kind="lunch",
+        hour_col_h="push_lunch_hour", hour_col_m="push_lunch_minute",
+        last_date_col="push_lunch_last_date",
+        skip_window_min=120,  # 2h
+        message_fn=pick_lunch,
+    )
+
+
+async def _dinner_nudge_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    from agent.nudges import pick_dinner
+    await _push_nudge_generic(
+        context, kind="dinner",
+        hour_col_h="push_dinner_hour", hour_col_m="push_dinner_minute",
+        last_date_col="push_dinner_last_date",
+        skip_window_min=180,  # 3h
+        message_fn=pick_dinner,
+    )
+
+
+async def _friday_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sexta às 19h local, manda resumo + gráfico da semana."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+    from agent.nudges import pick_friday
+    from agent.tools import _build_daily_chart  # noqa — usa pra reaproveitar
+    from agent import charts
+    import io as _io
+
+    try:
+        users = await db.users_due_for_push()
+    except Exception:
+        log.exception("falha buscando users pra friday")
+        return
+
+    now_utc = _dt.now(timezone.utc)
+    for u in users:
+        tz_name = u.get("timezone") or "America/Sao_Paulo"
+        try:
+            local = now_utc.astimezone(ZoneInfo(tz_name))
+        except Exception:
+            continue
+        # Sexta = weekday 4; 19:00 local
+        if local.weekday() != 4 or local.hour != 19 or local.minute != 0:
+            continue
+        today_local = local.date()
+        if u.get("push_friday_last_date") == today_local:
+            continue
+        try:
+            intro = pick_friday()
+            summary = await db.period_summary(u["user_id"], 7)
+            profile = await db.get_profile(u["user_id"]) or {}
+            goal = profile.get("daily_kcal")
+            totals = summary["totals"]
+            avgs = summary["averages"]
+            text = (
+                f"{intro}\n\n"
+                f"📊 7 dias:\n"
+                f"• Total: {totals['intake_kcal']:.0f} kcal consumidas, "
+                f"{totals['burned_kcal']} queimadas\n"
+                f"• Média: {avgs['intake_per_day']:.0f} kcal/dia"
+                + (f" (meta {goal})" if goal else "") + "\n\n"
+                "Bora pra próxima semana 💪"
+            )
+            await context.bot.send_message(chat_id=u["user_id"], text=text)
+            # Gráfico
+            png = charts.daily_intake_vs_goal(summary["per_day"], goal_kcal=goal,
+                                              title="Sua semana")
+            await context.bot.send_photo(chat_id=u["user_id"], photo=_io.BytesIO(png))
+            await db.mark_push_sent(u["user_id"], "friday", today_local)
+            log.info("sextou enviado pra user_id=%s", u["user_id"])
+        except Exception:
+            log.exception("falha enviando friday summary user_id=%s", u.get("user_id"))
+
+
 async def _weigh_in_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Job que roda a cada minuto. Dispara lembretes pra users no horário local certo."""
     from datetime import datetime as _dt
@@ -749,14 +795,46 @@ async def _weigh_in_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             "Manda só o número (ex: 101.8) ou foto da balança "
             "que eu atualizo seu peso e recalculo a meta do dia."
         )
+        sent_any = False
         try:
             await context.bot.send_message(
                 chat_id=u["user_id"],
                 text=reminder_text,
             )
-            await db.mark_reminder_sent(u["user_id"], today_local)
-            log.info("lembrete enviado pra user_id=%s (%02d:%02d local)",
+            sent_any = True
+            log.info("lembrete telegram enviado pra user_id=%s (%02d:%02d local)",
                      u["user_id"], hour, minute)
+        except Exception:
+            log.exception("falha enviando lembrete telegram user_id=%s", u.get("user_id"))
+
+        # WhatsApp: se este user_id está vinculado a um (ou mais) números, manda lá também.
+        # 3 cenários:
+        # - ALLOWED_USER_ID definido: só manda se user_id bater (single-user).
+        # - ALLOWED_USER_ID vazio: tenta casar via phone-derived id (multi-user).
+        # - WHATSAPP_LINK_PHONE vazio: pula (não sabemos pra qual phone mandar).
+        wa_phones_raw = os.environ.get("WHATSAPP_LINK_PHONE", "")
+        allowed = os.environ.get("ALLOWED_USER_ID")
+        wa_phones = [p.strip() for p in wa_phones_raw.split(",") if p.strip()]
+        if wa_phones and os.environ.get("TWILIO_ACCOUNT_SID"):
+            from whatsapp import send_whatsapp_message, _phone_to_user_id
+            # Decide se este user_id corresponde a algum dos telefones configurados
+            if allowed:
+                target_phones = wa_phones if str(u["user_id"]) == allowed else []
+            else:
+                target_phones = [p for p in wa_phones
+                                 if _phone_to_user_id(p) == u["user_id"]]
+            for phone in target_phones:
+                try:
+                    await send_whatsapp_message(phone, body=reminder_text)
+                    sent_any = True
+                    log.info("lembrete whatsapp enviado pra %s", phone)
+                except Exception:
+                    log.exception("falha enviando lembrete whatsapp pra %s", phone)
+
+        if not sent_any:
+            continue
+        try:
+            await db.mark_reminder_sent(u["user_id"], today_local)
             # Salva o lembrete no histórico da conversa do agente — assim quando o
             # user responder com foto/número, o agente tem o contexto pra interpretar.
             try:
@@ -765,7 +843,7 @@ async def _weigh_in_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 log.exception("falha salvando lembrete no histórico (não-crítico)")
         except Exception:
-            log.exception("falha enviando lembrete user_id=%s", u.get("user_id"))
+            log.exception("falha marcando lembrete enviado user_id=%s", u.get("user_id"))
 
 
 async def _post_init(app: Application) -> None:
@@ -775,19 +853,19 @@ async def _post_init(app: Application) -> None:
         log.warning("Banco vazio! Rode: python import_taco.py")
     else:
         log.info("DB pronto. %s alimentos carregados.", n)
-    # Job de lembrete: roda no minuto 0 de cada hora
-    from datetime import time as _time
-    app.job_queue.run_repeating(
-        _weigh_in_job, interval=60, first=10, name="weigh_in_reminder"
-    )
-    log.info("Lembrete de pesagem agendado (verifica a cada minuto).")
+    # Jobs agendados — todos checam a cada minuto e disparam conforme hora local do user
+    app.job_queue.run_repeating(_weigh_in_job, interval=60, first=10, name="weigh_in_reminder")
+    app.job_queue.run_repeating(_lunch_nudge_job, interval=60, first=20, name="lunch_nudge")
+    app.job_queue.run_repeating(_dinner_nudge_job, interval=60, first=30, name="dinner_nudge")
+    app.job_queue.run_repeating(_friday_summary_job, interval=60, first=40, name="friday_summary")
+    log.info("Lembrete de pesagem + 3 nudges agendados (todos checam a cada minuto).")
 
 
 async def _post_shutdown(app: Application) -> None:
     await db.close()
 
 
-def main() -> None:
+def _build_telegram_app() -> Application:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     app = (
         Application.builder()
@@ -808,14 +886,80 @@ def main() -> None:
     app.add_handler(CommandHandler("relatorio", cmd_relatorio))
     app.add_handler(CommandHandler("grafico", cmd_grafico))
     app.add_handler(CommandHandler("lembrete", cmd_lembrete))
+    app.add_handler(CommandHandler("push", cmd_push))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    return app
 
+
+def _whatsapp_enabled() -> bool:
+    """WhatsApp adapter sobe só se as creds Twilio estiverem configuradas."""
+    return all(
+        os.environ.get(k)
+        for k in ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_WHATSAPP_FROM",
+                  "WHATSAPP_LINK_PHONE", "PUBLIC_BASE_URL")
+    )
+
+
+async def _run_all() -> None:
+    """Roda Telegram polling + (opcional) FastAPI/Twilio webhook em paralelo."""
+    import asyncio
+    tg_app = _build_telegram_app()
+
+    # Start Telegram (não-bloqueante)
+    await tg_app.initialize()
+    await tg_app.start()
+    await tg_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    log.info("Telegram polling iniciado.")
+
+    server = None
+    if _whatsapp_enabled():
+        import uvicorn
+        from whatsapp import app as wa_app
+        # Injeta o tg_app pro lembrete saber mandar via Telegram também
+        wa_app.state.tg_bot = tg_app.bot
+        port = int(os.environ.get("WHATSAPP_WEBHOOK_PORT", "8000"))
+        host = os.environ.get("WHATSAPP_WEBHOOK_HOST", "0.0.0.0")
+        config = uvicorn.Config(wa_app, host=host, port=port, log_level="info",
+                                lifespan="on")
+        server = uvicorn.Server(config)
+        log.info("WhatsApp adapter iniciando em %s:%s", host, port)
+        server_task = asyncio.create_task(server.serve())
+    else:
+        log.info("WhatsApp adapter desabilitado (faltam creds Twilio no .env). "
+                 "Rodando só Telegram.")
+        server_task = None
+
+    try:
+        # Bloqueia até alguém quebrar (Ctrl+C → KeyboardInterrupt no asyncio.run)
+        if server_task:
+            await server_task
+        else:
+            # Sem WhatsApp: dorme até cancelar
+            while True:
+                await asyncio.sleep(3600)
+    finally:
+        log.info("Encerrando...")
+        if server is not None:
+            server.should_exit = True
+        try:
+            await tg_app.updater.stop()
+        except Exception:
+            pass
+        await tg_app.stop()
+        await tg_app.shutdown()
+
+
+def main() -> None:
+    import asyncio
     log.info("Bot rodando. Visão: %s | Chat: %s",
              os.environ.get("OPENROUTER_MODEL"),
              os.environ.get("OPENROUTER_CHAT_MODEL", "google/gemma-4-31b-it"))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        asyncio.run(_run_all())
+    except KeyboardInterrupt:
+        log.info("interrompido por usuário")
 
 
 if __name__ == "__main__":

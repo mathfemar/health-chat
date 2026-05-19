@@ -32,8 +32,16 @@ async def _apply_lightweight_migrations() -> None:
     migrations = [
         "alter table user_profiles add column if not exists weigh_in_minute int default 0",
         "alter table user_profiles add column if not exists timezone text default 'America/Sao_Paulo'",
-        # Garantir que perfis existentes sem tz pegam o default
         "update user_profiles set timezone='America/Sao_Paulo' where timezone is null",
+        # Sprint 3: push proativo
+        "alter table user_profiles add column if not exists push_enabled boolean default true",
+        "alter table user_profiles add column if not exists push_lunch_hour int default 13",
+        "alter table user_profiles add column if not exists push_lunch_minute int default 0",
+        "alter table user_profiles add column if not exists push_dinner_hour int default 20",
+        "alter table user_profiles add column if not exists push_dinner_minute int default 0",
+        "alter table user_profiles add column if not exists push_lunch_last_date date",
+        "alter table user_profiles add column if not exists push_dinner_last_date date",
+        "alter table user_profiles add column if not exists push_friday_last_date date",
     ]
     async with _pool.acquire() as conn:
         for sql in migrations:
@@ -205,6 +213,11 @@ _PROFILE_CONVERTERS = {
     "weigh_in_hour":     int,
     "weigh_in_minute":   int,
     "weigh_in_enabled":  lambda v: bool(v) if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes", "sim"),
+    "push_enabled":      lambda v: bool(v) if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes", "sim"),
+    "push_lunch_hour":   int,
+    "push_lunch_minute": int,
+    "push_dinner_hour":  int,
+    "push_dinner_minute": int,
     # string fields ficam sem converter
 }
 
@@ -218,6 +231,9 @@ async def upsert_profile_field(user_id: int, field: str, value) -> None:
         "timezone",
         "weigh_in_enabled", "weigh_in_hour", "weigh_in_minute",
         "weigh_in_tz", "weigh_in_last_date",
+        "push_enabled", "push_lunch_hour", "push_lunch_minute",
+        "push_dinner_hour", "push_dinner_minute",
+        "push_lunch_last_date", "push_dinner_last_date", "push_friday_last_date",
     }
     if field not in allowed:
         raise ValueError(f"Campo não permitido: {field}")
@@ -286,6 +302,41 @@ async def mark_reminder_sent(user_id: int, local_date) -> None:
         await conn.execute(
             "update user_profiles set weigh_in_last_date=$1 where user_id=$2",
             local_date, user_id,
+        )
+
+
+async def users_due_for_push() -> list[dict]:
+    """Retorna users com push habilitado. Filtra status no Python (timezone)."""
+    async with pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            select user_id, timezone,
+                   push_lunch_hour, push_lunch_minute,
+                   push_dinner_hour, push_dinner_minute,
+                   push_lunch_last_date, push_dinner_last_date, push_friday_last_date
+            from user_profiles
+            where push_enabled = true
+            """
+        )
+    return [dict(r) for r in rows]
+
+
+async def last_meal_at(user_id: int):
+    """Retorna timestamptz da última refeição logada (ou None)."""
+    async with pool().acquire() as conn:
+        return await conn.fetchval(
+            "select max(eaten_at) from meals where user_id=$1", user_id
+        )
+
+
+async def mark_push_sent(user_id: int, kind: str, local_date) -> None:
+    """kind: 'lunch' | 'dinner' | 'friday'"""
+    col = {"lunch": "push_lunch_last_date",
+           "dinner": "push_dinner_last_date",
+           "friday": "push_friday_last_date"}[kind]
+    async with pool().acquire() as conn:
+        await conn.execute(
+            f"update user_profiles set {col}=$1 where user_id=$2", local_date, user_id,
         )
 
 

@@ -3,7 +3,8 @@
 Cada tool retorna dict serializável (JSON). ctx é passado pelo runtime e contém:
   ctx['user_id']       : int
   ctx['conv_id']       : int  (id da conversa atual)
-  ctx['bot']           : objeto telegram.Bot pra baixar fotos
+  ctx['download_photo']: async callable (photo_ref: str) -> bytes | None
+                         injetado pelo adapter (Telegram ou Twilio/WhatsApp)
   ctx['vision_model']  : slug do modelo de visão
 """
 import io
@@ -427,10 +428,22 @@ async def get_recent_meals(ctx: dict, days: int = 7) -> dict:
 # --------------------------------------------------------------
 # 10. get_user_profile
 # --------------------------------------------------------------
-_ONBOARDING_ORDER = [
-    "timezone", "sex", "birth_date", "height_cm", "current_weight_kg",
-    "target_weight_kg", "activity_level", "weekly_rate_kg", "eatback_pct",
-]
+# Onboarding em 3 fases. Fases 1+2 são obrigatórias (6 perguntas) — depois disso
+# já dá pra calcular meta provisória com defaults sensatos e o user pode usar tudo.
+# Fase 3 é opcional, refina os 3 últimos campos.
+ONBOARDING_PHASE_1 = ["timezone", "sex", "birth_date"]
+ONBOARDING_PHASE_2 = ["height_cm", "current_weight_kg", "target_weight_kg"]
+ONBOARDING_PHASE_3 = ["activity_level", "weekly_rate_kg", "eatback_pct"]
+
+_ONBOARDING_ORDER = ONBOARDING_PHASE_1 + ONBOARDING_PHASE_2 + ONBOARDING_PHASE_3
+_REQUIRED_FIELDS = ONBOARDING_PHASE_1 + ONBOARDING_PHASE_2
+
+# Defaults pra meta provisória (fase 2 completa, fase 3 pendente)
+_PROVISIONAL_DEFAULTS = {
+    "activity_level": "sedentary",
+    "weekly_rate_kg": -0.5,
+    "eatback_pct": 100,
+}
 
 _QUESTION_TEMPLATES = {
     "timezone": (
@@ -476,22 +489,31 @@ _QUESTION_TEMPLATES = {
     parameters={"type": "object", "properties": {}},
 )
 async def get_user_profile(ctx: dict) -> dict:
-    p = await db.get_profile(ctx["user_id"])
-    if not p:
-        return {
-            "exists": False,
-            "missing": list(_ONBOARDING_ORDER),
-            "next_field": _ONBOARDING_ORDER[0],
-            "next_question": _QUESTION_TEMPLATES[_ONBOARDING_ORDER[0]],
-            "hint": "Faça SOMENTE a próxima pergunta (next_question). Salve com set_profile.",
-        }
+    p = await db.get_profile(ctx["user_id"]) or {}
 
-    missing = [k for k in _ONBOARDING_ORDER if p.get(k) is None]
-    next_field = missing[0] if missing else None
+    missing_all = [k for k in _ONBOARDING_ORDER if p.get(k) is None]
+    missing_required = [k for k in _REQUIRED_FIELDS if p.get(k) is None]
+    missing_phase_1 = [k for k in ONBOARDING_PHASE_1 if p.get(k) is None]
+    missing_phase_2 = [k for k in ONBOARDING_PHASE_2 if p.get(k) is None]
+    missing_phase_3 = [k for k in ONBOARDING_PHASE_3 if p.get(k) is None]
+
+    next_field = missing_all[0] if missing_all else None
     next_question = _QUESTION_TEMPLATES.get(next_field) if next_field else None
 
-    return {
-        "exists": True,
+    if missing_phase_1:
+        current_phase = 1
+    elif missing_phase_2:
+        current_phase = 2
+    elif missing_phase_3:
+        current_phase = 3
+    else:
+        current_phase = None
+
+    all_required_filled = not missing_required
+    optional_pending = bool(missing_phase_3)
+
+    base = {
+        "exists": bool(p),
         "name": p.get("name"),
         "timezone": p.get("timezone") or "America/Sao_Paulo",
         "sex": p.get("sex"),
@@ -505,15 +527,35 @@ async def get_user_profile(ctx: dict) -> dict:
         "daily_kcal": p.get("daily_kcal"),
         "daily_protein_g": p.get("daily_protein_g"),
         "preferences": p.get("preferences"),
-        "missing": missing,
+        "current_phase": current_phase,
+        "all_required_filled": all_required_filled,
+        "can_use_app": all_required_filled,
+        "optional_pending": optional_pending,
+        "missing": missing_all,
         "next_field": next_field,
         "next_question": next_question,
-        "hint": (
-            "Se missing está vazio, NÃO faça onboarding — responda o que o user pediu. "
-            "Se missing tem campos, faça SÓ a pergunta de next_question. "
-            "NÃO invente nome — name é opcional e pode ficar vazio."
-        ),
     }
+
+    if missing_required:
+        base["hint"] = (
+            f"Onboarding em andamento (fase {current_phase}/3). Faça SÓ next_question. "
+            "Salve com set_profile. NÃO invente nome."
+        )
+    elif optional_pending and not p.get("daily_kcal"):
+        base["hint"] = (
+            "🎉 Fase 2 completa! AGORA chame compute_daily_goal(provisional=true) "
+            "pra calcular meta com defaults (sedentary, -0.5kg/sem, eatback 100%). "
+            "Depois pergunte se o user quer afinar com 3 perguntas extras (fase 3)."
+        )
+    elif optional_pending:
+        base["hint"] = (
+            "Meta provisória calculada. Se user pedir 'afinar/refinar/ajustar', inicie fase 3 "
+            "(atividade, ritmo, eatback). Senão, responda normalmente o pedido dele."
+        )
+    else:
+        base["hint"] = "Perfil completo. NÃO faça onboarding — responda o pedido."
+
+    return base
 
 
 # --------------------------------------------------------------
@@ -567,15 +609,29 @@ async def set_profile(ctx: dict, field: str, value: str) -> dict:
     name="compute_daily_goal",
     description=(
         "Calcula meta calórica diária (Mifflin-St Jeor) + sugestão de macros. "
-        "Salva no perfil. Chame após coletar todos os campos do onboarding "
-        "ou quando o usuário atualizar peso/atividade."
+        "Salva no perfil. Use provisional=true APÓS fase 2 do onboarding (sem ter "
+        "atividade/ritmo/eatback ainda) — preenche defaults sedentary/-0.5/100%. "
+        "Use provisional=false (default) quando o user tiver completado a fase 3."
     ),
-    parameters={"type": "object", "properties": {}},
+    parameters={
+        "type": "object",
+        "properties": {
+            "provisional": {"type": "boolean", "default": False},
+        },
+    },
 )
-async def compute_daily_goal(ctx: dict) -> dict:
+async def compute_daily_goal(ctx: dict, provisional: bool = False) -> dict:
     p = await db.get_profile(ctx["user_id"])
     if not p:
         return {"error": "Perfil não existe — faça set_profile primeiro"}
+
+    # Se for provisória e faltam campos da fase 3, injeta defaults
+    if provisional:
+        for field, default in _PROVISIONAL_DEFAULTS.items():
+            if p.get(field) is None:
+                await db.upsert_profile_field(ctx["user_id"], field, default)
+                p[field] = default
+
     kcal = goals.daily_goal_kcal(p)
     if kcal is None:
         return {"error": "Faltam campos no perfil pra calcular",
@@ -591,7 +647,11 @@ async def compute_daily_goal(ctx: dict) -> dict:
         "protein_g": macros["protein_g"],
         "carbs_g": macros["carbs_g"],
         "fat_g": macros["fat_g"],
-        "explanation": "Mifflin-St Jeor + fator de atividade ± déficit/superávit (7700 kcal/kg).",
+        "is_provisional": provisional,
+        "explanation": (
+            "Mifflin-St Jeor + fator de atividade ± déficit/superávit (7700 kcal/kg)."
+            + (" Defaults: sedentary, -0.5 kg/sem, eatback 100%." if provisional else "")
+        ),
     }
 
 
@@ -1064,20 +1124,18 @@ async def remember(ctx: dict, key: str, value: str) -> dict:
 # Helpers
 # --------------------------------------------------------------
 async def _download_photo(ctx: dict, photo_id: str) -> bytes | None:
-    """Baixa foto. Se photo_id passado pelo LLM falhar (modelo corrompe IDs longos),
+    """Baixa foto via callable injetado pelo adapter (Telegram/WhatsApp).
+    Se photo_id passado pelo LLM falhar (modelo corrompe IDs longos),
     tenta o latest_photo_id que o runtime injetou no ctx."""
-    bot = ctx.get("bot")
-    if not bot:
+    downloader = ctx.get("download_photo")
+    if not downloader:
         return None
 
     async def _try(pid: str) -> bytes | None:
         try:
-            f = await bot.get_file(pid)
-            buf = io.BytesIO()
-            await f.download_to_memory(out=buf)
-            return buf.getvalue()
+            return await downloader(pid)
         except Exception as e:
-            log.warning("get_file falhou pra %s: %s", pid[:30] + "...", e)
+            log.warning("download_photo falhou pra %s: %s", pid[:30] + "...", e)
             return None
 
     # 1ª tentativa: o que o LLM passou
