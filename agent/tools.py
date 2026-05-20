@@ -1126,10 +1126,21 @@ async def remember(ctx: dict, key: str, value: str) -> dict:
 async def _download_photo(ctx: dict, photo_id: str) -> bytes | None:
     """Baixa foto via callable injetado pelo adapter (Telegram/WhatsApp).
     Se photo_id passado pelo LLM falhar (modelo corrompe IDs longos),
-    tenta o latest_photo_id que o runtime injetou no ctx."""
+    tenta o latest_photo_id que o runtime injetou no ctx.
+
+    Reusa ctx['latest_photo_bytes'] (cache do router) quando o photo_id
+    coincide com latest_photo_id — evita re-download desnecessário.
+    """
     downloader = ctx.get("download_photo")
     if not downloader:
         return None
+
+    # Cache: se o ID solicitado é o mesmo da foto desta msg, e o router já
+    # baixou os bytes, reusa direto. Ganha latência + evita duplo download.
+    cached = ctx.get("latest_photo_bytes")
+    latest_id = ctx.get("latest_photo_id")
+    if cached and (not photo_id or photo_id == latest_id):
+        return cached
 
     async def _try(pid: str) -> bytes | None:
         try:
@@ -1145,10 +1156,12 @@ async def _download_photo(ctx: dict, photo_id: str) -> bytes | None:
             return data
 
     # Fallback: a foto mais recente da conversa (que sabemos ser válida)
-    fallback = ctx.get("latest_photo_id")
-    if fallback and fallback != photo_id:
+    if latest_id and latest_id != photo_id:
+        if cached:
+            log.info("usando latest_photo_bytes cacheado como fallback")
+            return cached
         log.info("usando latest_photo_id como fallback (LLM corrompeu o ID?)")
-        data = await _try(fallback)
+        data = await _try(latest_id)
         if data:
             return data
     return None
