@@ -1055,6 +1055,181 @@ async def get_bot_capabilities_tool(ctx: dict) -> dict:
 
 
 # --------------------------------------------------------------
+# Meal templates (refeições salvas / atalhos)
+# --------------------------------------------------------------
+@tool(
+    name="list_meal_templates",
+    description=(
+        "Lista templates de refeição salvos do usuário (ex: 'whey com leite', "
+        "'marmita típica'). Cada um tem name, kcal e macros já calculados. "
+        "Use quando o user mencionar refeição salva, dizer 'tomei meu X', "
+        "ou clicar em 'Repetir'."
+    ),
+    parameters={"type": "object", "properties": {}},
+)
+async def list_meal_templates_tool(ctx: dict) -> dict:
+    rows = await db.list_meal_templates(ctx["user_id"])
+    return {
+        "templates": [
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "totals": r["totals"],
+                "used_count": r["used_count"],
+            }
+            for r in rows
+        ]
+    }
+
+
+@tool(
+    name="save_meal_template",
+    description=(
+        "Salva uma refeição como template pra reuso futuro. Duas formas:\n"
+        "  • from_last_meal=true: copia a refeição mais recente do user (preferido após log_meal)\n"
+        "  • items=[...]: lista explícita com {name, food_id, portion_g, kcal, protein_g, carbs_g, fat_g}\n"
+        "Sempre informe um name curto e claro (ex: 'whey com leite')."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Nome do template, ex: 'whey com leite'"},
+            "from_last_meal": {"type": "boolean", "default": False,
+                               "description": "Se true, copia a última refeição logada"},
+            "items": {
+                "type": "array",
+                "description": "Items explícitos (use APENAS se from_last_meal=false)",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "food_id": {"type": "integer"},
+                        "portion_g": {"type": "number"},
+                        "kcal": {"type": "number"},
+                        "protein_g": {"type": "number"},
+                        "carbs_g": {"type": "number"},
+                        "fat_g": {"type": "number"},
+                    },
+                    "required": ["name", "portion_g", "kcal", "protein_g", "carbs_g", "fat_g"],
+                },
+            },
+        },
+        "required": ["name"],
+    },
+)
+async def save_meal_template(ctx: dict, name: str,
+                              from_last_meal: bool = False,
+                              items: list | None = None) -> dict:
+    if from_last_meal:
+        last = await db.get_last_meal(ctx["user_id"])
+        if not last:
+            return {"error": "Sem refeição recente pra salvar"}
+        src_items = last["items"]
+        totals = {
+            "kcal": float(last["kcal"]),
+            "protein_g": float(last["protein_g"]),
+            "carbs_g": float(last["carbs_g"]),
+            "fat_g": float(last["fat_g"]),
+        }
+    elif items:
+        src_items = []
+        for it in items:
+            src_items.append({
+                "name_llm": it.get("name", "?"),
+                "food_id": it.get("food_id"),
+                "food_name": it.get("food_name") or it.get("name"),
+                "portion_g": float(it["portion_g"]),
+                "kcal": float(it["kcal"]),
+                "protein_g": float(it["protein_g"]),
+                "carbs_g": float(it["carbs_g"]),
+                "fat_g": float(it["fat_g"]),
+                "source": it.get("source", "template"),
+            })
+        totals = {
+            "kcal": round(sum(i["kcal"] for i in src_items), 1),
+            "protein_g": round(sum(i["protein_g"] for i in src_items), 1),
+            "carbs_g": round(sum(i["carbs_g"] for i in src_items), 1),
+            "fat_g": round(sum(i["fat_g"] for i in src_items), 1),
+        }
+    else:
+        return {"error": "Use from_last_meal=true OU items=[...]"}
+
+    try:
+        tid = await db.insert_meal_template(ctx["user_id"], name, src_items, totals)
+    except ValueError as e:
+        return {"error": str(e)}
+    return {
+        "template_id": tid, "name": name,
+        "items_count": len(src_items),
+        "totals": totals,
+    }
+
+
+@tool(
+    name="log_template",
+    description=(
+        "Loga uma refeição a partir de um template salvo. Use 'name' (string) "
+        "OU 'template_id' (int). Match por nome aceita substring "
+        "(ex: 'whey' acha 'whey com leite' se único). Anexa gráfico do dia."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "template_id": {"type": "integer"},
+        },
+    },
+)
+async def log_template(ctx: dict, name: str | None = None,
+                       template_id: int | None = None) -> dict:
+    key = template_id if template_id is not None else name
+    if key is None:
+        return {"error": "informe name ou template_id"}
+    t = await db.find_meal_template(ctx["user_id"], key)
+    if not t:
+        return {"error": f"template '{key}' não encontrado"}
+
+    # Insere meal a partir dos items + totals do template
+    meal_id = await db.insert_meal(
+        user_id=ctx["user_id"],
+        vision_model="template",
+        photo_file_id=None,
+        items=t["items"],
+        totals=t["totals"],
+        notes=f"template:{t['name']}",
+    )
+    await db.mark_template_used(t["id"])
+    # Auto-anexa gráfico do dia (mesma UX do log_meal normal)
+    await _attach_daily_chart_to_scratchpad(ctx)
+    return {
+        "meal_id": meal_id,
+        "template_name": t["name"],
+        "totals": t["totals"],
+        "daily_chart_attached": True,
+    }
+
+
+@tool(
+    name="delete_meal_template",
+    description="Apaga um template salvo. Aceita name ou template_id.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "template_id": {"type": "integer"},
+        },
+    },
+)
+async def delete_meal_template_tool(ctx: dict, name: str | None = None,
+                                     template_id: int | None = None) -> dict:
+    key = template_id if template_id is not None else name
+    if key is None:
+        return {"error": "informe name ou template_id"}
+    ok = await db.delete_meal_template(ctx["user_id"], key)
+    return {"ok": ok}
+
+
+# --------------------------------------------------------------
 # save_food_alias: ensina o matcher quando user aceita um substituto
 # --------------------------------------------------------------
 @tool(

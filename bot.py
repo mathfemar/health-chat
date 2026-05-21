@@ -50,7 +50,7 @@ MAIN_KB = ReplyKeyboardMarkup(
 
 MORE_KB = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("📈 Relatório"), KeyboardButton("⏰ Lembrete")],
+        [KeyboardButton("🔁 Repetir"), KeyboardButton("📈 Relatório"), KeyboardButton("⏰ Lembrete")],
         [KeyboardButton("🔍 Buscar"), KeyboardButton("❓ Ajuda")],
         [KeyboardButton("🔄 Nova conversa"), KeyboardButton("⬅️ Voltar")],
     ],
@@ -289,6 +289,103 @@ async def cmd_apagar(update: Update, _) -> None:
     await _send_result(update, r)
 
 
+async def cmd_salvar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Salva a última refeição logada como template.
+    Uso: /salvar <nome>      ex: /salvar whey com leite
+    """
+    if not _guard(update): return
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            "Uso: <code>/salvar &lt;nome&gt;</code>\n"
+            "Ex: <code>/salvar whey com leite</code>\n\n"
+            "Salva sua ÚLTIMA refeição logada como template. "
+            "Depois você usa <code>/r whey</code> pra repetir.",
+            parse_mode=ParseMode.HTML, reply_markup=MAIN_KB,
+        )
+        return
+    name = " ".join(context.args).strip()
+    last = await db.get_last_meal(user_id)
+    if not last:
+        await update.message.reply_text("Sem refeição recente pra salvar. Loga uma primeiro.")
+        return
+    totals = {
+        "kcal": float(last["kcal"]), "protein_g": float(last["protein_g"]),
+        "carbs_g": float(last["carbs_g"]), "fat_g": float(last["fat_g"]),
+    }
+    try:
+        tid = await db.insert_meal_template(user_id, name, last["items"], totals)
+    except ValueError as e:
+        await update.message.reply_text(f"Erro: {e}")
+        return
+    await update.message.reply_text(
+        f"✅ Template <b>{_esc(name)}</b> salvo (#{tid})\n"
+        f"🔥 {totals['kcal']:.0f} kcal · P {totals['protein_g']:.0f}g\n\n"
+        f"Use <code>/r {name.split()[0]}</code> pra logar de novo.",
+        parse_mode=ParseMode.HTML, reply_markup=MAIN_KB,
+    )
+
+
+async def cmd_repetir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Loga template direto. Uso: /r <nome>  ex: /r whey
+    Sem args → lista templates disponíveis."""
+    if not _guard(update): return
+    user_id = update.effective_user.id
+    if not context.args:
+        # Lista templates como botões clicáveis
+        templates = await db.list_meal_templates(user_id, limit=10)
+        if not templates:
+            await update.message.reply_text(
+                "Você não tem refeições salvas ainda.\n\n"
+                "Loga uma refeição, depois use <code>/salvar nome</code> pra criar um template.",
+                parse_mode=ParseMode.HTML, reply_markup=MAIN_KB,
+            )
+            return
+        rows = []
+        for t in templates:
+            tot = t["totals"]
+            label = f"{t['name']} — {tot.get('kcal', 0):.0f} kcal"
+            rows.append([InlineKeyboardButton(label[:60],
+                                              callback_data=f"tpl:{t['id']}")])
+        await update.message.reply_text(
+            "Qual refeição salva você quer logar?",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+    name = " ".join(context.args).strip()
+    t = await db.find_meal_template(user_id, name)
+    if not t:
+        await update.message.reply_text(
+            f"Não achei template '<b>{_esc(name)}</b>'. Use <code>/r</code> sem args pra ver a lista.",
+            parse_mode=ParseMode.HTML, reply_markup=MAIN_KB,
+        )
+        return
+    await _log_template_and_reply(update, user_id, t)
+
+
+async def _log_template_and_reply(update: Update, user_id: int, template: dict) -> None:
+    meal_id = await db.insert_meal(
+        user_id=user_id, vision_model="template", photo_file_id=None,
+        items=template["items"], totals=template["totals"],
+        notes=f"template:{template['name']}",
+    )
+    await db.mark_template_used(template["id"])
+    tot = template["totals"]
+    await update.message.reply_text(
+        f"✅ <b>{_esc(template['name'])}</b> logado (#{meal_id})\n"
+        f"🔥 {tot.get('kcal', 0):.0f} kcal · "
+        f"P {tot.get('protein_g', 0):.0f}  C {tot.get('carbs_g', 0):.0f}  G {tot.get('fat_g', 0):.0f}",
+        parse_mode=ParseMode.HTML, reply_markup=MAIN_KB,
+    )
+    # Anexa gráfico do dia
+    try:
+        from agent.tools import _build_daily_chart
+        png = await _build_daily_chart(user_id)
+        await update.message.reply_photo(photo=io.BytesIO(png))
+    except Exception:
+        log.exception("falha no gráfico após /r")
+
+
 async def cmd_grafico(update: Update, _) -> None:
     if not _guard(update): return
     r = await commands.cmd_grafico(update.effective_user.id, [])
@@ -441,6 +538,12 @@ async def _btn_voltar(update: Update, _) -> None:
     await update.message.reply_text("⬅️ Voltar", reply_markup=MAIN_KB)
 
 
+async def _btn_repetir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Atalho pro /r sem args — lista templates como botões."""
+    context.args = []
+    await cmd_repetir(update, context)
+
+
 async def _btn_buscar(update: Update, _) -> None:
     await update.message.reply_text(
         "🔍 Use: <code>/buscar &lt;termo&gt;</code>\nEx: <code>/buscar arroz integral</code>",
@@ -462,6 +565,7 @@ BUTTON_HANDLERS = {
     "📊 Hoje": lambda u, c: cmd_hoje(u, c),
     "🎯 Meta": lambda u, c: cmd_perfil(u, c),
     "⚙️ Mais": _btn_mais,
+    "🔁 Repetir": _btn_repetir,
     "📈 Relatório": _btn_relatorio,
     "⏰ Lembrete": lambda u, c: cmd_lembrete(u, c),
     "🔍 Buscar": _btn_buscar,
@@ -536,6 +640,39 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await q.answer()
     data = q.data or ""
     user_id = update.effective_user.id
+
+    # tpl:<template_id> — clique num template da lista do /r
+    if data.startswith("tpl:"):
+        try:
+            tpl_id = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await q.message.reply_text("ID de template inválido.")
+            return
+        t = await db.find_meal_template(user_id, tpl_id)
+        if not t:
+            await q.message.reply_text("Template não encontrado.")
+            return
+        meal_id = await db.insert_meal(
+            user_id=user_id, vision_model="template", photo_file_id=None,
+            items=t["items"], totals=t["totals"],
+            notes=f"template:{t['name']}",
+        )
+        await db.mark_template_used(t["id"])
+        tot = t["totals"]
+        await q.edit_message_text(
+            f"✅ <b>{_esc(t['name'])}</b> logado (#{meal_id})\n"
+            f"🔥 {tot.get('kcal', 0):.0f} kcal · "
+            f"P {tot.get('protein_g', 0):.0f}  C {tot.get('carbs_g', 0):.0f}  G {tot.get('fat_g', 0):.0f}",
+            parse_mode=ParseMode.HTML,
+        )
+        # Anexa gráfico
+        try:
+            from agent.tools import _build_daily_chart
+            png = await _build_daily_chart(user_id)
+            await q.message.reply_photo(photo=io.BytesIO(png))
+        except Exception:
+            log.exception("falha no gráfico após tpl:")
+        return
 
     # cmd:<slash_command> — dispatch genérico de Suggestion (botão de sugestão)
     if data.startswith("cmd:"):

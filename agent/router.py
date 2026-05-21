@@ -17,6 +17,7 @@ log = logging.getLogger("agent.router")
 
 Intent = Literal[
     "log_meal_now",
+    "log_template",
     "choose_from_menu",
     "log_weight",
     "log_exercise",
@@ -43,6 +44,12 @@ INTENT_TOOL_SETS: dict[str, set[str]] = {
         "estimate_meal_from_photo", "log_meal",
         "search_foods", "search_vitat", "fetch_vitat_food",
         "get_food_portions", "save_food_alias",
+        "save_meal_template",
+        "get_user_profile", "get_calorie_balance",
+        "generate_daily_chart",
+    },
+    "log_template": {
+        "list_meal_templates", "log_template",
         "get_user_profile", "get_calorie_balance",
         "generate_daily_chart",
     },
@@ -81,6 +88,11 @@ INTENT_TOOL_SETS: dict[str, set[str]] = {
 
 # Micro-prompts injetados SÓ no turno onde o intent for detectado
 INTENT_ADDENDUMS: dict[str, str] = {
+    "log_template": (
+        "[Intent: log_template] Usuário quer logar uma refeição SALVA (template). "
+        "Use list_meal_templates pra ver as opções, match o nome, e chame log_template. "
+        "Se ambíguo (2+ templates batem), pergunte qual. Sem tools de busca de alimentos."
+    ),
     "choose_from_menu": (
         "[Intent: choose_from_menu] Usuário quer AJUDA pra escolher do cardápio. "
         "Use parse_menu pra ler. NUNCA chame log_meal — ele NÃO comeu ainda. "
@@ -120,6 +132,15 @@ _KEYWORDS_LOG_MEAL = re.compile(
     r"loga.*refei|registra.*comi|acabei.*de.*comer)\b",
     re.IGNORECASE,
 )
+# "tomei meu whey", "comi minha marmita", "fiz meu shake", "repete o X"
+_KEYWORDS_TEMPLATE = re.compile(
+    r"\b("
+    r"(tomei|comi|fiz|peguei|preparei|registra)\s+(meu|minha|o|a|aquele|aquela)\s+\w+"
+    r"|repet(e|ir)\s+\w+"
+    r"|loga\s+(meu|minha)\s+\w+"
+    r")\b",
+    re.IGNORECASE,
+)
 _KEYWORDS_STATUS = re.compile(
     r"\b(como.*t[áa]|quanto.*falta|balanco|balanço|sobrou|j[áa] comi|"
     r"resumo|gr[áa]fico|relat[óo]rio)\b",
@@ -152,6 +173,10 @@ def classify_text(text: str) -> tuple[Intent | None, float]:
         return "query_status", 0.80
     if _KEYWORDS_EXERCISE.search(s):
         return "log_exercise", 0.75
+    # Template tem que vir ANTES de log_meal porque "comi minha marmita"
+    # bateria nos dois — preferimos o template (mais específico)
+    if _KEYWORDS_TEMPLATE.search(s):
+        return "log_template", 0.8
     if _KEYWORDS_LOG_MEAL.search(s):
         return "log_meal_now", 0.75
     return None, 0.0
