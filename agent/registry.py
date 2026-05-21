@@ -36,8 +36,15 @@ def get(name: str) -> ToolDef | None:
     return _REGISTRY.get(name)
 
 
-def openai_schema() -> list[dict]:
-    """Formato esperado pelo OpenRouter/OpenAI/Gemma 4 tool calling."""
+def openai_schema(allowed: set[str] | None = None) -> list[dict]:
+    """Formato esperado pelo OpenRouter/OpenAI/Gemma 4 tool calling.
+
+    Se `allowed` for um set de nomes, filtra pra retornar só essas tools.
+    Se None, retorna todas (comportamento padrão). Backward-compatible.
+    """
+    items = _REGISTRY.values()
+    if allowed is not None:
+        items = [t for t in items if t.name in allowed]
     return [
         {
             "type": "function",
@@ -47,7 +54,7 @@ def openai_schema() -> list[dict]:
                 "parameters": t.parameters,
             },
         }
-        for t in _REGISTRY.values()
+        for t in items
     ]
 
 

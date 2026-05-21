@@ -372,7 +372,7 @@ async def cmd_modelo_show(user_id: int, args: list[str]) -> CommandResult:
     estado em memória do Telegram não é compartilhado). Pra trocar de canal,
     use /modelo no Telegram."""
     vision = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash")
-    chat = os.environ.get("OPENROUTER_CHAT_MODEL", "google/gemma-4-31b-it")
+    chat = os.environ.get("OPENROUTER_CHAT_MODEL", "deepseek/deepseek-chat-v3.1:free")
     return CommandResult(text=f"Visão: {vision}\nChat (agente): {chat}")
 
 

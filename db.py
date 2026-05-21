@@ -42,6 +42,20 @@ async def _apply_lightweight_migrations() -> None:
         "alter table user_profiles add column if not exists push_lunch_last_date date",
         "alter table user_profiles add column if not exists push_dinner_last_date date",
         "alter table user_profiles add column if not exists push_friday_last_date date",
+        # Templates de refeição (atalhos: "tomei meu whey")
+        """create table if not exists meal_templates (
+            id              serial primary key,
+            user_id         bigint not null,
+            name            text not null,
+            name_normalized text not null,
+            items           jsonb not null,
+            totals          jsonb not null,
+            used_count      int default 0,
+            last_used_at    timestamptz,
+            created_at      timestamptz default now(),
+            unique(user_id, name_normalized)
+        )""",
+        "create index if not exists meal_templates_user_idx on meal_templates(user_id, last_used_at desc nulls last)",
     ]
     async with _pool.acquire() as conn:
         for sql in migrations:
@@ -170,6 +184,154 @@ async def list_today(user_id: int) -> list[dict]:
             start,
         )
     return [dict(r) for r in rows]
+
+
+# ============================================================
+# Meal templates (refeições salvas)
+# ============================================================
+def _norm_name(s: str) -> str:
+    """Lower + strip + remove acentos pra comparar nomes de template."""
+    import unicodedata
+    s = (s or "").lower().strip()
+    s = "".join(c for c in unicodedata.normalize("NFD", s)
+                if unicodedata.category(c) != "Mn")
+    import re
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+async def list_meal_templates(user_id: int, limit: int = 20) -> list[dict]:
+    async with pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            select id, name, items, totals, used_count, last_used_at, created_at
+            from meal_templates
+            where user_id=$1
+            order by used_count desc, last_used_at desc nulls last, created_at desc
+            limit $2
+            """,
+            user_id, limit,
+        )
+    out = []
+    for r in rows:
+        d = dict(r)
+        # items/totals já vêm como dict do asyncpg pra jsonb, mas defensivo:
+        if isinstance(d["items"], str):
+            d["items"] = json.loads(d["items"])
+        if isinstance(d["totals"], str):
+            d["totals"] = json.loads(d["totals"])
+        out.append(d)
+    return out
+
+
+async def find_meal_template(user_id: int, name_or_id) -> dict | None:
+    """Aceita id (int) ou nome (string com fuzzy: exato → substring no normalized)."""
+    pool_ = pool()
+    # Tenta como id primeiro
+    try:
+        tid = int(name_or_id)
+        async with pool_.acquire() as conn:
+            row = await conn.fetchrow(
+                "select * from meal_templates where id=$1 and user_id=$2",
+                tid, user_id,
+            )
+        if row:
+            return _row_template(row)
+    except (TypeError, ValueError):
+        pass
+
+    norm = _norm_name(str(name_or_id))
+    async with pool_.acquire() as conn:
+        # match exato
+        row = await conn.fetchrow(
+            "select * from meal_templates where user_id=$1 and name_normalized=$2",
+            user_id, norm,
+        )
+        if row:
+            return _row_template(row)
+        # match substring (LIKE %x%)
+        row = await conn.fetchrow(
+            """
+            select * from meal_templates
+            where user_id=$1 and name_normalized like '%' || $2 || '%'
+            order by used_count desc, length(name_normalized) asc
+            limit 1
+            """,
+            user_id, norm,
+        )
+    return _row_template(row) if row else None
+
+
+def _row_template(row) -> dict:
+    d = dict(row)
+    if isinstance(d.get("items"), str):
+        d["items"] = json.loads(d["items"])
+    if isinstance(d.get("totals"), str):
+        d["totals"] = json.loads(d["totals"])
+    return d
+
+
+async def insert_meal_template(user_id: int, name: str,
+                                items: list, totals: dict) -> int:
+    norm = _norm_name(name)
+    if not norm:
+        raise ValueError("nome do template vazio")
+    async with pool().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            insert into meal_templates (user_id, name, name_normalized, items, totals)
+            values ($1, $2, $3, $4::jsonb, $5::jsonb)
+            on conflict (user_id, name_normalized) do update set
+                items = excluded.items,
+                totals = excluded.totals
+            returning id
+            """,
+            user_id, name.strip(), norm,
+            json.dumps(items, default=str), json.dumps(totals, default=str),
+        )
+    return row["id"]
+
+
+async def mark_template_used(template_id: int) -> None:
+    async with pool().acquire() as conn:
+        await conn.execute(
+            """
+            update meal_templates
+            set used_count = used_count + 1, last_used_at = now()
+            where id=$1
+            """,
+            template_id,
+        )
+
+
+async def delete_meal_template(user_id: int, name_or_id) -> bool:
+    t = await find_meal_template(user_id, name_or_id)
+    if not t:
+        return False
+    async with pool().acquire() as conn:
+        r = await conn.execute(
+            "delete from meal_templates where id=$1 and user_id=$2",
+            t["id"], user_id,
+        )
+    return r.endswith(" 1")
+
+
+async def get_last_meal(user_id: int) -> dict | None:
+    async with pool().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            select id, items, kcal, protein_g, carbs_g, fat_g, notes, eaten_at
+            from meals where user_id=$1
+            order by created_at desc limit 1
+            """,
+            user_id,
+        )
+    if not row:
+        return None
+    d = dict(row)
+    if isinstance(d["items"], str):
+        d["items"] = json.loads(d["items"])
+    return d
 
 
 async def get_food(food_id: int) -> dict | None:

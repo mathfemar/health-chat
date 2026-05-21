@@ -6,7 +6,7 @@ import os
 import httpx
 
 import db
-from agent import prompts, registry, tools  # noqa: F401 (registra tools)
+from agent import prompts, registry, router as nlu_router, tools  # noqa: F401 (registra tools)
 
 log = logging.getLogger("agent")
 
@@ -17,7 +17,7 @@ SUMMARIZE_AT = 30        # quando passa disso, comprime as antigas
 
 
 def _chat_model() -> str:
-    return os.environ.get("OPENROUTER_CHAT_MODEL", "google/gemma-4-31b-it")
+    return os.environ.get("OPENROUTER_CHAT_MODEL", "deepseek/deepseek-chat-v3.1:free")
 
 
 async def get_or_create_conversation(user_id: int) -> dict:
@@ -130,9 +130,41 @@ async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
         user_content = f"{marker}\n{user_content}".strip()
     await add_message(conv_id, "user", content=user_content, photo_file_id=photo_file_id)
 
-    # 2. monta payload base
+    # 1.5 NLU determinística: classifica intent + restringe tool set
+    # Baixa foto UMA vez aqui (router precisa, tools reaproveitam via ctx)
+    photo_bytes: bytes | None = None
+    if photo_file_id:
+        try:
+            photo_bytes = await download_photo(photo_file_id)
+        except Exception:
+            log.exception("falha baixando foto pro router")
+    history_for_router = await _load_messages(conv_id)
+    decision = await nlu_router.classify(
+        text=user_text or "",
+        photo_bytes=photo_bytes,
+        history=history_for_router,
+        vision_model=vision_model,
+    )
+
+    # 2. monta payload base (com addendum do router quando aplicável)
     summary = await _load_summary(conv_id)
     system_blocks = [prompts.SYSTEM_PROMPT]
+    if decision.system_addendum:
+        system_blocks.append(decision.system_addendum)
+    # Pré-carrega templates de refeição do user (até 10 mais usados)
+    try:
+        templates = await db.list_meal_templates(user_id, limit=10)
+        if templates:
+            lines = ["[Refeições salvas do usuário — use log_template pra logar:]"]
+            for t in templates:
+                tot = t["totals"]
+                lines.append(
+                    f"  • {t['name']} — {tot.get('kcal',0):.0f} kcal "
+                    f"(P {tot.get('protein_g',0):.0f}g)"
+                )
+            system_blocks.append("\n".join(lines))
+    except Exception:
+        log.exception("falha carregando templates")
     if summary:
         system_blocks.append(f"\n[Resumo da conversa anterior]\n{summary}")
     system_msg = {"role": "system", "content": "\n".join(system_blocks)}
@@ -144,6 +176,10 @@ async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
         "vision_model": vision_model,
         # Foto desta msg (ou da última, recuperada do DB se nesta não veio)
         "latest_photo_id": photo_file_id or await _last_photo_id(conv_id),
+        # Cache: tools de visão reaproveitam pra evitar re-download
+        "latest_photo_bytes": photo_bytes,
+        # Roteamento (debug / log)
+        "routing_decision": decision,
     }
 
     # 3. loop de tool calling
@@ -161,7 +197,7 @@ async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
             "temperature": 0.3,
         }
         if not force_final:
-            payload["tools"] = registry.openai_schema()
+            payload["tools"] = registry.openai_schema(decision.allowed_tools)
             payload["tool_choice"] = "auto"
         else:
             # Injeta instrução pra fechar
