@@ -66,6 +66,21 @@ create table meals (
 );
 create index meals_user_eaten_idx on meals (user_id, eaten_at desc);
 
+-- Templates de refeição (atalhos: "tomei meu whey" → loga direto, zero LLM)
+create table meal_templates (
+    id              serial primary key,
+    user_id         bigint not null,
+    name            text not null,
+    name_normalized text not null,
+    items           jsonb not null,        -- mesma estrutura de meals.items
+    totals          jsonb not null,        -- {kcal, protein_g, carbs_g, fat_g}
+    used_count      int default 0,
+    last_used_at    timestamptz,
+    created_at      timestamptz default now(),
+    unique(user_id, name_normalized)
+);
+create index meal_templates_user_idx on meal_templates(user_id, last_used_at desc);
+
 -- ============ EXERCÍCIOS ============
 create table exercises (
     id            bigserial primary key,

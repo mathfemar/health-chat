@@ -151,6 +151,20 @@ async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
     system_blocks = [prompts.SYSTEM_PROMPT]
     if decision.system_addendum:
         system_blocks.append(decision.system_addendum)
+    # Pré-carrega templates de refeição do user (até 10 mais usados)
+    try:
+        templates = await db.list_meal_templates(user_id, limit=10)
+        if templates:
+            lines = ["[Refeições salvas do usuário — use log_template pra logar:]"]
+            for t in templates:
+                tot = t["totals"]
+                lines.append(
+                    f"  • {t['name']} — {tot.get('kcal',0):.0f} kcal "
+                    f"(P {tot.get('protein_g',0):.0f}g)"
+                )
+            system_blocks.append("\n".join(lines))
+    except Exception:
+        log.exception("falha carregando templates")
     if summary:
         system_blocks.append(f"\n[Resumo da conversa anterior]\n{summary}")
     system_msg = {"role": "system", "content": "\n".join(system_blocks)}
