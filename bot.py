@@ -261,7 +261,7 @@ async def cmd_modelo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     else:
         await update.message.reply_text(
             f"Visão: {_current_model(context)}\n"
-            f"Chat (agente): {os.environ.get('OPENROUTER_CHAT_MODEL', 'google/gemma-4-31b-it')}"
+            f"Chat (agente): {os.environ.get('OPENROUTER_CHAT_MODEL', 'deepseek/deepseek-chat-v3.1:free')}"
         )
 
 
@@ -1092,7 +1092,7 @@ def main() -> None:
     import asyncio
     log.info("Bot rodando. Visão: %s | Chat: %s",
              os.environ.get("OPENROUTER_MODEL"),
-             os.environ.get("OPENROUTER_CHAT_MODEL", "google/gemma-4-31b-it"))
+             os.environ.get("OPENROUTER_CHAT_MODEL", "deepseek/deepseek-chat-v3.1:free"))
     try:
         asyncio.run(_run_all())
     except KeyboardInterrupt:

@@ -17,7 +17,7 @@ SUMMARIZE_AT = 30        # quando passa disso, comprime as antigas
 
 
 def _chat_model() -> str:
-    return os.environ.get("OPENROUTER_CHAT_MODEL", "google/gemma-4-31b-it")
+    return os.environ.get("OPENROUTER_CHAT_MODEL", "deepseek/deepseek-chat-v3.1:free")
 
 
 async def get_or_create_conversation(user_id: int) -> dict:
