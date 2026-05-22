@@ -619,7 +619,7 @@ async def _agent_handle(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     # 1. Manda placeholder imediato. Vamos editar essa msg no final.
     try:
-        placeholder = await msg.reply_text("🤔 Pensando…")
+        placeholder = await msg.reply_text("Pensando…")
     except Exception:
         log.exception("falha mandando placeholder — caindo no modo antigo")
         placeholder = None
@@ -629,7 +629,7 @@ async def _agent_handle(update: Update, context: ContextTypes.DEFAULT_TYPE,
     typing_task = asyncio.create_task(_typing_loop(msg.chat, stop_event))
 
     # 3. Callback de progresso: edita o placeholder quando uma tool inicia
-    last_label = {"v": "🤔 Pensando…"}
+    last_label = {"v": "Pensando…"}
 
     async def on_progress(label: str) -> None:
         if placeholder is None or label == last_label["v"]:

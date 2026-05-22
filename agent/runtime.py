@@ -171,44 +171,44 @@ async def _post_openrouter(payload: dict) -> dict:
 
 
 # Mapa de tool → label humano pra mostrar como progresso enquanto roda.
-# Tools fora desse mapa caem no fallback "⚙️ {name}".
+# Tools fora desse mapa caem no fallback com o nome cru.
 _TOOL_PROGRESS_LABELS = {
     # Visão
-    "estimate_meal_from_photo": "📷 Analisando o prato",
-    "parse_menu_image": "📷 Lendo o cardápio",
-    "parse_menu_photo": "📷 Lendo o cardápio",
-    "parse_watch_photo": "📷 Lendo o relógio",
-    "parse_scale_photo": "📷 Lendo a balança",
+    "estimate_meal_from_photo": "Analisando o prato",
+    "parse_menu_image": "Lendo o cardápio",
+    "parse_menu_photo": "Lendo o cardápio",
+    "parse_watch_photo": "Lendo o relógio",
+    "parse_scale_photo": "Lendo a balança",
     # Search / match
-    "search_foods": "🔍 Buscando alimentos",
-    "search_vitat": "🌿 Consultando Vitat",
-    "fetch_vitat_food": "🌿 Consultando Vitat",
-    "get_food_portions": "🔍 Conferindo porções",
+    "search_foods": "Buscando alimentos",
+    "search_vitat": "Consultando Vitat",
+    "fetch_vitat_food": "Consultando Vitat",
+    "get_food_portions": "Conferindo porções",
     # Log
-    "log_meal": "📝 Registrando refeição",
-    "log_template": "📝 Registrando refeição",
-    "log_weight": "⚖️ Salvando peso",
-    "log_exercise": "🏃 Registrando treino",
+    "log_meal": "Registrando refeição",
+    "log_template": "Registrando refeição",
+    "log_weight": "Salvando peso",
+    "log_exercise": "Registrando treino",
     # Profile / goal
-    "set_profile": "🎯 Atualizando perfil",
-    "compute_daily_goal": "🎯 Calculando meta",
-    "compare_to_goal": "🎯 Comparando com meta",
+    "set_profile": "Atualizando perfil",
+    "compute_daily_goal": "Calculando meta",
+    "compare_to_goal": "Comparando com meta",
     # Read
-    "get_today_summary": "📊 Consultando o dia",
-    "get_calorie_balance": "📊 Calculando saldo",
-    "get_recent_meals": "📊 Buscando refeições",
-    "get_period_summary": "📊 Resumindo período",
+    "get_today_summary": "Consultando o dia",
+    "get_calorie_balance": "Calculando saldo",
+    "get_recent_meals": "Buscando refeições",
+    "get_period_summary": "Resumindo período",
     # Charts
-    "generate_daily_chart": "📊 Gerando gráfico",
-    "generate_weight_chart": "📊 Gerando gráfico de peso",
-    "generate_report_chart": "📊 Gerando relatório",
+    "generate_daily_chart": "Gerando gráfico",
+    "generate_weight_chart": "Gerando gráfico de peso",
+    "generate_report_chart": "Gerando relatório",
     # Other
-    "remember": "💭 Anotando",
+    "remember": "Anotando",
 }
 
 
 def _tool_progress_label(tool_name: str) -> str:
-    return _TOOL_PROGRESS_LABELS.get(tool_name, f"⚙️ {tool_name}")
+    return _TOOL_PROGRESS_LABELS.get(tool_name, tool_name)
 
 
 async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
