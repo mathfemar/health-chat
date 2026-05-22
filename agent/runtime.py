@@ -170,9 +170,56 @@ async def _post_openrouter(payload: dict) -> dict:
         return data
 
 
+# Mapa de tool → label humano pra mostrar como progresso enquanto roda.
+# Tools fora desse mapa caem no fallback "⚙️ {name}".
+_TOOL_PROGRESS_LABELS = {
+    # Visão
+    "estimate_meal_from_photo": "📷 Analisando o prato",
+    "parse_menu_image": "📷 Lendo o cardápio",
+    "parse_menu_photo": "📷 Lendo o cardápio",
+    "parse_watch_photo": "📷 Lendo o relógio",
+    "parse_scale_photo": "📷 Lendo a balança",
+    # Search / match
+    "search_foods": "🔍 Buscando alimentos",
+    "search_vitat": "🌿 Consultando Vitat",
+    "fetch_vitat_food": "🌿 Consultando Vitat",
+    "get_food_portions": "🔍 Conferindo porções",
+    # Log
+    "log_meal": "📝 Registrando refeição",
+    "log_template": "📝 Registrando refeição",
+    "log_weight": "⚖️ Salvando peso",
+    "log_exercise": "🏃 Registrando treino",
+    # Profile / goal
+    "set_profile": "🎯 Atualizando perfil",
+    "compute_daily_goal": "🎯 Calculando meta",
+    "compare_to_goal": "🎯 Comparando com meta",
+    # Read
+    "get_today_summary": "📊 Consultando o dia",
+    "get_calorie_balance": "📊 Calculando saldo",
+    "get_recent_meals": "📊 Buscando refeições",
+    "get_period_summary": "📊 Resumindo período",
+    # Charts
+    "generate_daily_chart": "📊 Gerando gráfico",
+    "generate_weight_chart": "📊 Gerando gráfico de peso",
+    "generate_report_chart": "📊 Gerando relatório",
+    # Other
+    "remember": "💭 Anotando",
+}
+
+
+def _tool_progress_label(tool_name: str) -> str:
+    return _TOOL_PROGRESS_LABELS.get(tool_name, f"⚙️ {tool_name}")
+
+
 async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
-                   download_photo, vision_model: str) -> str:
-    """Executa um turno completo. Retorna o texto pra mandar ao usuário."""
+                   download_photo, vision_model: str,
+                   on_progress=None) -> str:
+    """Executa um turno completo. Retorna o texto pra mandar ao usuário.
+
+    on_progress: callable opcional (async ou sync) `on_progress(label: str)`
+        chamado quando uma nova tool começa a executar. Permite ao adapter
+        (Telegram) mostrar 'pensando…' com etapa atual. Tolerante a falha.
+    """
     conv = await get_or_create_conversation(user_id)
     conv_id = conv["id"]
 
@@ -305,6 +352,14 @@ async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
             except json.JSONDecodeError:
                 args = {}
             log.info("[agent] tool: %s(%s)", name, args)
+            # Sinaliza progresso pro adapter (Telegram edita o placeholder)
+            if on_progress is not None:
+                try:
+                    res = on_progress(_tool_progress_label(name))
+                    if hasattr(res, "__await__"):
+                        await res
+                except Exception:
+                    log.debug("on_progress callback falhou (não-crítico)", exc_info=True)
             try:
                 result = await registry.call(name, args, ctx)
             except Exception as e:
