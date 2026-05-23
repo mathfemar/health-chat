@@ -594,15 +594,58 @@ async def _telegram_download_photo(bot, file_id: str) -> bytes | None:
     return buf.getvalue()
 
 
+async def _typing_loop(chat, stop_event: "asyncio.Event") -> None:
+    """Mantém o indicador 'digitando…' do Telegram aceso enquanto o agente roda.
+    O Telegram apaga sozinho em ~5s, então re-enviamos a cada 4s."""
+    import asyncio
+    while not stop_event.is_set():
+        try:
+            await chat.send_action(ChatAction.TYPING)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=4.0)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def _agent_handle(update: Update, context: ContextTypes.DEFAULT_TYPE,
                         text: str, photo_file_id: str | None) -> None:
-    """Rota pro agente conversacional."""
+    """Rota pro agente conversacional. Mostra placeholder 'pensando…' e
+    atualiza com a etapa atual (tool sendo executada). Quando termina,
+    edita o placeholder com a resposta final (em vez de mandar nova msg)."""
+    import asyncio
     msg = update.message
-    await msg.chat.send_action(ChatAction.TYPING)
+
+    # 1. Manda placeholder imediato. Vamos editar essa msg no final.
+    try:
+        placeholder = await msg.reply_text("Pensando…")
+    except Exception:
+        log.exception("falha mandando placeholder — caindo no modo antigo")
+        placeholder = None
+
+    # 2. Mantém 'typing…' aceso em paralelo
+    stop_event = asyncio.Event()
+    typing_task = asyncio.create_task(_typing_loop(msg.chat, stop_event))
+
+    # 3. Callback de progresso: edita o placeholder quando uma tool inicia
+    last_label = {"v": "Pensando…"}
+
+    async def on_progress(label: str) -> None:
+        if placeholder is None or label == last_label["v"]:
+            return
+        last_label["v"] = label
+        try:
+            await placeholder.edit_text(label + "…")
+        except Exception:
+            # Rate limit ou msg deletada — ignora silenciosamente
+            log.debug("edit_text de progresso falhou", exc_info=True)
 
     async def _dl(pid: str) -> bytes | None:
         return await _telegram_download_photo(context.bot, pid)
 
+    reply: str | None = None
+    error_text: str | None = None
     try:
         reply = await agent.run_turn(
             user_id=update.effective_user.id,
@@ -610,18 +653,49 @@ async def _agent_handle(update: Update, context: ContextTypes.DEFAULT_TYPE,
             photo_file_id=photo_file_id,
             download_photo=_dl,
             vision_model=_current_model(context),
+            on_progress=on_progress,
         )
     except Exception as e:
         log.exception("agent.run_turn failed")
-        await msg.reply_text(f"Agente quebrou: {e}")
-        return
+        error_text = f"Agente quebrou: {e}"
+    finally:
+        stop_event.set()
+        try:
+            await typing_task
+        except Exception:
+            pass
 
+    final_text = error_text or (reply or "(sem resposta)")
     # Converte markdown comum pra HTML (Gemma às vezes escapa do prompt)
-    reply = _md_to_html(reply)
-    try:
-        await msg.reply_text(reply, parse_mode=ParseMode.HTML)
-    except Exception:
-        await msg.reply_text(reply)
+    final_text = _md_to_html(final_text)
+
+    # 4. Edita o placeholder com a resposta final.
+    # Se a edição falhar (HTML inválido, msg apagada, msg muito longa >4096),
+    # cai pra mandar nova mensagem e apagar o placeholder.
+    sent_ok = False
+    if placeholder is not None:
+        try:
+            await placeholder.edit_text(final_text, parse_mode=ParseMode.HTML)
+            sent_ok = True
+        except Exception:
+            log.debug("edit_text final falhou, tentando sem HTML", exc_info=True)
+            try:
+                await placeholder.edit_text(final_text)
+                sent_ok = True
+            except Exception:
+                log.debug("edit_text plain também falhou", exc_info=True)
+
+    if not sent_ok:
+        # Fallback: nova msg + apaga placeholder se existir
+        try:
+            await msg.reply_text(final_text, parse_mode=ParseMode.HTML)
+        except Exception:
+            await msg.reply_text(final_text)
+        if placeholder is not None:
+            try:
+                await placeholder.delete()
+            except Exception:
+                pass
 
     # Se o agente gerou um gráfico (via generate_report_chart), envia agora
     conv = await agent.get_or_create_conversation(update.effective_user.id)
