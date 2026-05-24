@@ -103,7 +103,34 @@ async def _load_summary(conv_id: int) -> str | None:
         return await conn.fetchval("select summary from conversations where id=$1", conv_id)
 
 
+class OpenRouterError(RuntimeError):
+    """Erro estruturado do OpenRouter. status_code=0 quando a resposta veio
+    'OK' (HTTP 200) mas não tinha 'choices' válidos (rate-limit, content filter,
+    provider offline retornando JSON sem o formato esperado, etc)."""
+    def __init__(self, message: str, status_code: int = 0, body: str = ""):
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body
+
+
+def _user_friendly_openrouter_error(err: OpenRouterError) -> str:
+    """Converte OpenRouterError em mensagem amigável pro user final."""
+    sc = err.status_code
+    if sc == 401:
+        return "Chave da OpenRouter inválida ou revogada. Verifica `OPENROUTER_API_KEY` no .env."
+    if sc == 402:
+        return "Sem créditos na OpenRouter. Recarrega em openrouter.ai/credits."
+    if sc == 403:
+        return "Modelo bloqueado (privacy/content filter). Tenta outro modelo ou ajusta em openrouter.ai/settings/privacy."
+    if sc == 429:
+        return "Rate limit da OpenRouter — tenta de novo em alguns segundos."
+    if sc >= 500:
+        return "OpenRouter ou o provedor do modelo está fora do ar. Tenta de novo em ~1min."
+    return "Modelo indisponível agora. Tenta de novo em alguns segundos."
+
+
 async def _post_openrouter(payload: dict) -> dict:
+    """Chama OpenRouter e valida resposta. Levanta OpenRouterError em falha."""
     headers = {
         "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
         "Content-Type": "application/json",
@@ -112,9 +139,35 @@ async def _post_openrouter(payload: dict) -> dict:
     }
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(OPENROUTER_URL, json=payload, headers=headers)
+        body_preview = r.text[:500]
         if r.status_code >= 400:
-            raise RuntimeError(f"OpenRouter {r.status_code}: {r.text}")
-        return r.json()
+            log.warning("OpenRouter HTTP %s: %s", r.status_code, body_preview)
+            raise OpenRouterError(
+                f"OpenRouter {r.status_code}", status_code=r.status_code, body=r.text,
+            )
+        try:
+            data = r.json()
+        except Exception as e:
+            log.warning("OpenRouter resposta não-JSON: %s", body_preview)
+            raise OpenRouterError(
+                f"resposta inválida: {e}", status_code=r.status_code, body=r.text,
+            )
+        # Validação de formato — alguns providers retornam HTTP 200 com {"error":...}
+        # em vez de erro HTTP, e às vezes 'choices' vem vazio ou ausente.
+        if isinstance(data, dict) and data.get("error"):
+            err_info = data["error"]
+            msg = err_info.get("message") if isinstance(err_info, dict) else str(err_info)
+            log.warning("OpenRouter erro embutido (HTTP %s): %s", r.status_code, msg)
+            raise OpenRouterError(
+                f"erro do provedor: {msg}", status_code=r.status_code, body=r.text,
+            )
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not choices:
+            log.warning("OpenRouter sem 'choices' (HTTP %s): %s", r.status_code, body_preview)
+            raise OpenRouterError(
+                "resposta sem 'choices'", status_code=r.status_code, body=r.text,
+            )
+        return data
 
 
 async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
@@ -246,12 +299,26 @@ async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
 
         try:
             raw = await _post_openrouter(payload)
+        except OpenRouterError as e:
+            log.warning("OpenRouter falhou no step %s: %s", step, e)
+            # Se já tivemos tool calls bem-sucedidas neste turno, sintetizamos
+            # uma resposta com o que rodou; senão, mensagem amigável.
+            if tool_history:
+                final_text = _synthesize_fallback_text(tool_history)
+            else:
+                final_text = _user_friendly_openrouter_error(e)
+            break
         except Exception as e:
-            log.exception("OpenRouter call falhou")
+            log.exception("OpenRouter call falhou (não-OpenRouterError)")
             final_text = f"Erro chamando o modelo: {e}"
             break
 
-        choice = raw["choices"][0]["message"]
+        try:
+            choice = raw["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as e:
+            log.error("OpenRouter resposta com formato inesperado: %r", raw)
+            final_text = "Modelo retornou resposta vazia. Tenta de novo."
+            break
         tool_calls = choice.get("tool_calls") or []
         text = choice.get("content")
 

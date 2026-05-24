@@ -1,3 +1,4 @@
+import asyncio
 import html
 import io
 import json
@@ -800,11 +801,33 @@ async def _telegram_download_photo(bot, file_id: str) -> bytes | None:
     return buf.getvalue()
 
 
+async def _typing_loop(chat, stop_event: asyncio.Event) -> None:
+    """Mantém o indicador 'digitando…' do Telegram aceso enquanto o agente roda.
+    O Telegram apaga sozinho em ~5s, então re-enviamos a cada 4s."""
+    while not stop_event.is_set():
+        try:
+            await chat.send_action(ChatAction.TYPING)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=4.0)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def _agent_handle(update: Update, context: ContextTypes.DEFAULT_TYPE,
                         text: str, photo_file_id: str | None) -> None:
-    """Rota pro agente conversacional, com feedback de estágios."""
+    """Rota pro agente conversacional, com feedback visual em 3 camadas:
+    1) Mensagem 'Pensando…' viva, editada a cada estágio do runtime
+    2) ChatAction.TYPING re-enviado a cada 4s pra não sumir em turnos longos
+    3) No fim, a própria msg de loading vira a resposta (edit in-place)
+    """
     msg = update.message
-    await msg.chat.send_action(ChatAction.TYPING)
+
+    # Loop paralelo de TYPING — Telegram apaga o indicador após ~5s, então
+    # turnos longos (visão + várias tools) fariam parecer travado sem isso.
+    stop_event = asyncio.Event()
+    typing_task = asyncio.create_task(_typing_loop(msg.chat, stop_event))
 
     async def _dl(pid: str) -> bytes | None:
         return await _telegram_download_photo(context.bot, pid)
@@ -834,6 +857,8 @@ async def _agent_handle(update: Update, context: ContextTypes.DEFAULT_TYPE,
             # 400 "message is not modified", rate limit, msg deletada pelo user, etc.
             log.debug("edit loading falhou — ignorado", exc_info=True)
 
+    reply: str | None = None
+    error_text: str | None = None
     try:
         reply = await agent.run_turn(
             user_id=update.effective_user.id,
@@ -845,17 +870,17 @@ async def _agent_handle(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
     except Exception as e:
         log.exception("agent.run_turn failed")
-        if loading_msg is not None:
-            try:
-                await loading_msg.edit_text(f"Agente quebrou: {e}")
-            except Exception:
-                await msg.reply_text(f"Agente quebrou: {e}")
-        else:
-            await msg.reply_text(f"Agente quebrou: {e}")
-        return
+        error_text = f"Agente quebrou: {e}"
+    finally:
+        stop_event.set()
+        try:
+            await typing_task
+        except Exception:
+            pass
 
+    final_text = error_text or (reply or "(sem resposta)")
     # Converte markdown comum pra HTML (Gemma às vezes escapa do prompt)
-    reply = _md_to_html(reply) or "(sem resposta)"
+    final_text = _md_to_html(final_text) or "(sem resposta)"
 
     # Se há proposta pendente NOVA (vinda do propose_meal deste turno),
     # anexa inline kb [✅ Logar] [🕐 Horário] [❌ Cancelar]
@@ -866,25 +891,31 @@ async def _agent_handle(update: Update, context: ContextTypes.DEFAULT_TYPE,
         markup = _proposal_keyboard(pending["id"], pending.get("eaten_at_iso"))
 
     # Edita a msg de loading com a resposta final (mais limpo que apagar+mandar).
-    # Fallback: se edit falhar (msg muito longa, foi apagada, etc), manda nova.
+    # Fallback: se edit falhar (msg longa, foi apagada, HTML inválido), manda nova.
     sent_via_edit = False
     if loading_msg is not None:
         try:
             await loading_msg.edit_text(
-                reply, parse_mode=ParseMode.HTML, reply_markup=markup,
+                final_text, parse_mode=ParseMode.HTML, reply_markup=markup,
             )
             sent_via_edit = True
         except Exception:
-            log.debug("edit final falhou — vou mandar msg nova", exc_info=True)
+            log.debug("edit final HTML falhou — tento plain", exc_info=True)
             try:
-                await loading_msg.delete()
+                await loading_msg.edit_text(final_text, reply_markup=markup)
+                sent_via_edit = True
             except Exception:
-                pass
+                log.debug("edit plain também falhou — vou mandar nova msg",
+                          exc_info=True)
+                try:
+                    await loading_msg.delete()
+                except Exception:
+                    pass
     if not sent_via_edit:
         try:
-            await msg.reply_text(reply, parse_mode=ParseMode.HTML, reply_markup=markup)
+            await msg.reply_text(final_text, parse_mode=ParseMode.HTML, reply_markup=markup)
         except Exception:
-            await msg.reply_text(reply, reply_markup=markup)
+            await msg.reply_text(final_text, reply_markup=markup)
 
     # Se o agente gerou um gráfico (via generate_report_chart), envia agora
     chart_bytes = await db.pop_pending_chart(conv["id"])

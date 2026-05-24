@@ -31,8 +31,19 @@ async def _post(model: str, messages: list[dict], json_mode: bool = True) -> dic
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(OPENROUTER_URL, json=payload, headers=headers)
         if r.status_code >= 400:
-            raise RuntimeError(f"OpenRouter {r.status_code}: {r.text}")
-        return r.json()
+            raise RuntimeError(f"OpenRouter {r.status_code}: {r.text[:500]}")
+        try:
+            data = r.json()
+        except Exception as e:
+            raise RuntimeError(f"OpenRouter resposta não-JSON: {e} | {r.text[:200]}")
+        # Provider às vezes devolve HTTP 200 mas com {"error": ...} no body
+        if isinstance(data, dict) and data.get("error"):
+            err = data["error"]
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            raise RuntimeError(f"OpenRouter erro embutido: {msg}")
+        if not (isinstance(data, dict) and data.get("choices")):
+            raise RuntimeError(f"OpenRouter sem 'choices' no body: {r.text[:200]}")
+        return data
 
 
 def _image_message(prompt: str, image_bytes: bytes, mime_type: str) -> list[dict]:
