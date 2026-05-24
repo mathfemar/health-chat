@@ -224,6 +224,62 @@ async def test_long_response_with_pending_does_not_confirm():
 
 
 # ============================================================
+# edit_meal — mover/editar refeição já logada
+# ============================================================
+async def test_move_meal_strong_keyword():
+    """'muda a pizza pra 21h' → edit_meal direto, sem contexto extra."""
+    d = await _classify_text_only("muda a pizza pra 21h de ontem")
+    assert d.intent == "edit_meal", f"esperado edit_meal, veio {d.intent}"
+    assert d.allowed_tools is not None
+    assert "edit_meal" in d.allowed_tools
+    assert "log_meal" not in d.allowed_tools, \
+        "log_meal não pode estar disponível em edit_meal"
+    assert "propose_meal" not in d.allowed_tools, \
+        "propose_meal não pode estar disponível em edit_meal"
+
+
+async def test_edit_meal_explicit_verbs():
+    for phrase in ["edita a refeição 15", "altera o horário",
+                   "corrige #12", "atualiza pra ontem"]:
+        d = await _classify_text_only(phrase)
+        assert d.intent == "edit_meal", \
+            f"'{phrase}' deveria ser edit_meal, veio {d.intent}"
+
+
+async def test_registre_como_with_bot_listing_routes_to_edit():
+    """Caso do screenshot: bot listou refeições, user disse 'registre como 21h'
+    → edit_meal."""
+    history = [
+        {"role": "user", "content": "/ontem"},
+        {"role": "assistant", "content": (
+            "Ontem (23/05)\n"
+            "Refeições (2)\n"
+            "  #12  03:59  Pizza de calabresa — 280 kcal\n"
+            "  #15  03:34  Cocada diet — 90 kcal"
+        )},
+    ]
+    d = await _classify_text_only(
+        "Cocada e pizza registre como 9 da noite de ontem",
+        history=history,
+    )
+    assert d.intent == "edit_meal", \
+        f"com bot tendo listado #N, 'registre como' deve virar edit_meal, veio {d.intent}"
+
+
+async def test_registre_como_without_context_is_not_edit():
+    """'registre como X' SEM o bot ter listado refeições → NÃO é edit_meal."""
+    d = await _classify_text_only("registre como almoço")
+    assert d.intent != "edit_meal", \
+        "sem contexto de listagem, 'registre como' não pode virar edit"
+
+
+async def test_new_meal_text_does_not_match_edit():
+    """'comi 100g de arroz' → log_meal_now, não edit_meal."""
+    d = await _classify_text_only("comi 100g de arroz e bife")
+    assert d.intent == "log_meal_now", f"esperado log_meal_now, veio {d.intent}"
+
+
+# ============================================================
 # Runner
 # ============================================================
 ALL_TESTS = [
@@ -244,6 +300,11 @@ ALL_TESTS = [
     test_sim_without_pending_is_free_chat,
     test_loga_with_pending_routes_to_confirm,
     test_long_response_with_pending_does_not_confirm,
+    test_move_meal_strong_keyword,
+    test_edit_meal_explicit_verbs,
+    test_registre_como_with_bot_listing_routes_to_edit,
+    test_registre_como_without_context_is_not_edit,
+    test_new_meal_text_does_not_match_edit,
 ]
 
 

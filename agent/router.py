@@ -19,6 +19,7 @@ Intent = Literal[
     "log_meal_now",
     "log_template",
     "choose_from_menu",
+    "edit_meal",
     "log_weight",
     "log_exercise",
     "query_status",
@@ -55,6 +56,14 @@ INTENT_TOOL_SETS: dict[str, set[str]] = {
     },
     "cancel_pending": {
         "cancel_proposal",
+    },
+    "edit_meal": {
+        # Editar refeição já logada. SEM propose_meal/log_meal — evita
+        # o bug de "registre como 21h" criar duplicata em vez de mover.
+        "edit_meal",
+        "get_recent_meals", "get_today_summary",
+        "get_calorie_balance", "get_user_profile",
+        "generate_daily_chart",
     },
     "log_template": {
         "list_meal_templates", "log_template",
@@ -134,6 +143,15 @@ INTENT_ADDENDUMS: dict[str, str] = {
         "[Intent: cancel_pending] User cancelou a proposta pendente. "
         "Chame cancel_proposal() e responda 'Ok, cancelei.'."
     ),
+    "edit_meal": (
+        "[Intent: edit_meal] User quer EDITAR uma refeição JÁ logada — "
+        "tipicamente mover horário ('registra como 21h de ontem'). "
+        "Identifique o(s) meal_id(s) — o bot acabou de listar com #N — "
+        "e chame edit_meal(meal_id=N, eaten_at=ISO) pra cada um. "
+        "NUNCA chame propose_meal/log_meal aqui — você só está mexendo "
+        "em refeições existentes. Se faltar o #N e não vier no contexto, "
+        "use get_recent_meals pra descobrir, ou peça o ID ao user."
+    ),
 }
 
 
@@ -173,6 +191,29 @@ _KEYWORDS_ONBOARDING = re.compile(
     r"\b(definir.*meta|quero.*meta|come[çc]ar|configurar.*perfil|onboarding)\b",
     re.IGNORECASE,
 )
+
+# Edição de refeição já logada. Dois sinais:
+#  (1) verbos explícitos de edição ("muda", "move", "edita", "altera", "corrige")
+#  (2) "registra/registre/loga como X" — ambíguo sozinho; só conta como edit se
+#      o bot acabou de mostrar IDs de refeição (#12, #15...) no turno anterior
+_KEYWORDS_EDIT_STRONG = re.compile(
+    r"\b("
+    r"mov(e|er|a|i)|muda(r|nça)?|alter(a|ar|e)|edita(r)?|edite|"
+    r"corrig(e|ir|i)|atualiz(a|ar|e)|"
+    r"troc(a|ar|e).*(hor[áa]ri|data|comida|item|porç)"
+    r")\b",
+    re.IGNORECASE,
+)
+_KEYWORDS_EDIT_WEAK = re.compile(
+    r"\b(registra|registre|registrar|loga|logar|salva|salvar)\s+como\b",
+    re.IGNORECASE,
+)
+# Regex pra detectar se a última msg do bot citou IDs de refeição (#12, #15)
+# ou listou "Pizza X — atualmente registrada em Y" etc.
+_BOT_LISTED_MEALS = re.compile(
+    r"(#\d+|atualmente\s+registrada|refei[çc][ãa]o\s+#?\d+)",
+    re.IGNORECASE,
+)
 _WEIGHT_ONLY = re.compile(r"^\s*\d{2,3}([.,]\d)?\s*(kg)?\s*$", re.IGNORECASE)
 
 # Confirmação / cancelamento de proposta pendente. Match curto/exato pra não
@@ -196,11 +237,17 @@ _KEYWORDS_CANCEL = re.compile(
 )
 
 
-def classify_text(text: str, has_pending: bool = False) -> tuple[Intent | None, float]:
+def classify_text(text: str, has_pending: bool = False,
+                  bot_listed_meals: bool = False) -> tuple[Intent | None, float]:
     """Retorna (intent_sugerido, confiança) só por texto. None = não decidiu.
 
-    has_pending: se True (há proposal_proposal no scratchpad), 'sim/não' viram
-    intents fortes de confirm/cancel. Sem pending, 'sim' isolado é ambíguo demais."""
+    has_pending: se True (há pending_proposal no scratchpad), 'sim/não' viram
+    intents fortes de confirm/cancel. Sem pending, 'sim' isolado é ambíguo demais.
+
+    bot_listed_meals: se True (a última msg do bot citou IDs de refeição ou
+    'atualmente registrada em'), então 'registre como X' vira edit_meal —
+    isso resolve o caso 'pizza registre como 9 da noite de ontem' depois do
+    bot ter listado a pizza com horário errado."""
     if not text or not text.strip():
         return None, 0.0
     s = text.strip()
@@ -210,6 +257,12 @@ def classify_text(text: str, has_pending: bool = False) -> tuple[Intent | None, 
             return "confirm_pending", 0.95
         if _KEYWORDS_CANCEL.match(s):
             return "cancel_pending", 0.92
+    # Edição de refeição já logada
+    if _KEYWORDS_EDIT_STRONG.search(s):
+        return "edit_meal", 0.85
+    if bot_listed_meals and _KEYWORDS_EDIT_WEAK.search(s):
+        # "registre como 21h" sozinho é ambíguo; com contexto vira edit
+        return "edit_meal", 0.85
     if _WEIGHT_ONLY.match(s):
         return "log_weight", 0.95
     if _KEYWORDS_ONBOARDING.search(s):
@@ -298,6 +351,20 @@ def _combine(
 # ============================================================
 # API pública
 # ============================================================
+def _last_bot_listed_meals(history: list[dict]) -> bool:
+    """True se a última msg do bot citou IDs de refeição (#12) ou
+    'atualmente registrada em' etc — indicador de que o user pode estar
+    se referindo a refeições JÁ logadas no próximo turno."""
+    for msg in reversed(history):
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content") or ""
+        if not content:
+            continue
+        return bool(_BOT_LISTED_MEALS.search(content))
+    return False
+
+
 async def classify(
     text: str,
     photo_bytes: bytes | None,
@@ -314,7 +381,12 @@ async def classify(
         algo não relacionado, mas se é uma resposta curta confirmatória, vence)
     """
     has_pending = pending_kind is not None
-    text_intent, text_conf = classify_text(text or "", has_pending=has_pending)
+    bot_listed_meals = _last_bot_listed_meals(history or [])
+    text_intent, text_conf = classify_text(
+        text or "",
+        has_pending=has_pending,
+        bot_listed_meals=bot_listed_meals,
+    )
 
     image_kind, image_conf = (None, 0.0)
     if photo_bytes:
@@ -344,6 +416,7 @@ async def classify(
             "image_kind": image_kind,
             "image_conf": image_conf,
             "bot_last": bot_last,
+            "bot_listed_meals": bot_listed_meals,
             "pending_kind": pending_kind,
         },
     )

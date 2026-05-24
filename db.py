@@ -136,6 +136,59 @@ async def update_meal_items(meal_id: int, items: list[dict], totals: dict) -> No
         )
 
 
+async def update_meal(
+    meal_id: int,
+    user_id: int,
+    eaten_at: datetime | None = None,
+    items: list[dict] | None = None,
+    totals: dict | None = None,
+    notes: str | None = None,
+) -> dict | None:
+    """Atualização parcial. Passa só os campos que mudam. Retorna meal atualizado
+    ou None se não existir / não for do user (guard de user_id obrigatório).
+
+    Se items vier sem totals, recalcula sum dos items. Se totals vier sem items,
+    sobrescreve totals sem mexer nos items (raramente útil)."""
+    if items is not None and totals is None:
+        totals = {
+            "kcal": round(sum(float(i["kcal"]) for i in items), 1),
+            "protein_g": round(sum(float(i["protein_g"]) for i in items), 1),
+            "carbs_g": round(sum(float(i["carbs_g"]) for i in items), 1),
+            "fat_g": round(sum(float(i["fat_g"]) for i in items), 1),
+        }
+
+    sets: list[str] = []
+    args: list = []
+    if eaten_at is not None:
+        args.append(eaten_at)
+        sets.append(f"eaten_at = ${len(args)}")
+    if items is not None:
+        args.append(json.dumps(items))
+        sets.append(f"items = ${len(args)}::jsonb")
+    if totals is not None:
+        for k in ("kcal", "protein_g", "carbs_g", "fat_g"):
+            args.append(totals[k])
+            sets.append(f"{k} = ${len(args)}")
+    if notes is not None:
+        args.append(notes)
+        sets.append(f"notes = ${len(args)}")
+
+    if not sets:
+        # Nada pra atualizar — retorna meal atual como cortesia
+        return await get_meal(meal_id, user_id)
+
+    args.append(meal_id)
+    args.append(user_id)
+    sql = f"""
+        update meals set {", ".join(sets)}
+        where id = ${len(args) - 1} and user_id = ${len(args)}
+        returning *
+    """
+    async with pool().acquire() as conn:
+        row = await conn.fetchrow(sql, *args)
+    return dict(row) if row else None
+
+
 async def delete_meal(user_id: int, meal_id: int) -> bool:
     async with pool().acquire() as conn:
         r = await conn.execute("delete from meals where id=$1 and user_id=$2", meal_id, user_id)

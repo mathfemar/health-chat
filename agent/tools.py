@@ -348,13 +348,128 @@ async def log_meal(ctx: dict, items: list, notes: str | None = None,
     }
 
 
-# Helpers usados por log_meal + propose_meal + confirm_proposal
+# Helpers usados por log_meal + propose_meal + confirm_proposal + edit_meal
 def _sum_totals(items: list) -> dict:
     return {
         "kcal": round(sum(float(i["kcal"]) for i in items), 1),
         "protein_g": round(sum(float(i["protein_g"]) for i in items), 1),
         "carbs_g": round(sum(float(i["carbs_g"]) for i in items), 1),
         "fat_g": round(sum(float(i["fat_g"]) for i in items), 1),
+    }
+
+
+# --------------------------------------------------------------
+# edit_meal — atualiza refeição JÁ logada (move horário, troca items, etc)
+# --------------------------------------------------------------
+@tool(
+    name="edit_meal",
+    description=(
+        "Edita uma refeição JÁ LOGADA (já está no diário). Use SEMPRE que o "
+        "user pedir pra MOVER horário, CORRIGIR data, TROCAR itens, ALTERAR "
+        "porção de uma refeição que aparece na listagem (ex: '/hoje' ou '/ontem'). "
+        "NUNCA crie refeição nova com propose_meal/log_meal pra esses casos — "
+        "isso duplica o registro. "
+        "Você precisa do meal_id (vem como #N na listagem ou via get_recent_meals). "
+        "Passa só os campos que mudam — o resto fica como está. "
+        "Pode chamar várias vezes no mesmo turno pra editar múltiplas refeições."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "meal_id": {
+                "type": "integer",
+                "description": "ID da refeição existente (o #N que aparece na listagem).",
+            },
+            "eaten_at": {
+                "type": "string",
+                "description": (
+                    "ISO 8601 opcional. Use quando user disse pra mover horário "
+                    "(ex: 'registra como 21h de ontem' → '2026-05-23T21:00:00-03:00')."
+                ),
+            },
+            "items": {
+                "type": "array",
+                "description": (
+                    "Lista COMPLETA dos novos itens (substitui a anterior). "
+                    "Use quando user pediu pra trocar/adicionar/remover items."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "portion_g": {"type": "number"},
+                        "kcal": {"type": "number"},
+                        "protein_g": {"type": "number"},
+                        "carbs_g": {"type": "number"},
+                        "fat_g": {"type": "number"},
+                        "source": {"type": "string"},
+                        "food_id": {"type": "integer"},
+                        "food_name": {"type": "string"},
+                    },
+                    "required": ["name", "portion_g", "kcal", "protein_g", "carbs_g", "fat_g"],
+                },
+            },
+            "notes": {"type": "string"},
+        },
+        "required": ["meal_id"],
+    },
+)
+async def edit_meal(ctx: dict, meal_id: int,
+                    eaten_at: str | None = None,
+                    items: list | None = None,
+                    notes: str | None = None) -> dict:
+    parsed_eaten = _parse_iso_safe(eaten_at)
+    norm_items = _normalize_meal_items(items) if items is not None else None
+
+    updated = await db.update_meal(
+        meal_id=meal_id,
+        user_id=ctx["user_id"],
+        eaten_at=parsed_eaten,
+        items=norm_items,
+        notes=notes,
+    )
+    if updated is None:
+        return {
+            "error": f"Refeição #{meal_id} não existe ou não é sua.",
+            "hint": "Use get_recent_meals pra ver os IDs disponíveis.",
+        }
+
+    # Anexa gráfico se a refeição (após edit) cair no DIA local de hoje
+    from zoneinfo import ZoneInfo
+    profile = await db.get_profile(ctx["user_id"]) or {}
+    tz_name = profile.get("timezone") or "America/Sao_Paulo"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("America/Sao_Paulo")
+    eaten = updated["eaten_at"]
+    is_today = (
+        hasattr(eaten, "astimezone")
+        and eaten.astimezone(tz).date() == datetime.now(tz).date()
+    )
+    if is_today:
+        await _attach_daily_chart_to_scratchpad(ctx)
+
+    return {
+        "ok": True,
+        "meal_id": meal_id,
+        "eaten_at": (
+            updated["eaten_at"].isoformat()
+            if hasattr(updated["eaten_at"], "isoformat")
+            else str(updated["eaten_at"])
+        ),
+        "totals": {
+            "kcal": float(updated["kcal"]),
+            "protein_g": float(updated["protein_g"]),
+            "carbs_g": float(updated["carbs_g"]),
+            "fat_g": float(updated["fat_g"]),
+        },
+        "daily_chart_attached": is_today,
+        "fields_changed": [
+            k for k, v in {
+                "eaten_at": eaten_at, "items": items, "notes": notes,
+            }.items() if v is not None
+        ],
     }
 
 
