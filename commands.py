@@ -16,7 +16,6 @@ from __future__ import annotations
 import html as _html
 import json
 import logging
-import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -71,13 +70,14 @@ COMMANDS_HELP_TELEGRAM = """\
 <b>Todos os comandos (também acessíveis via botões):</b>
 /start /ajuda — esta mensagem
 /perfil — perfil e meta
-/hoje /semana — totais do período
+/hoje /ontem — refeições do dia
+/dia [data] — refeições de outro dia (ex: /dia 23/05, /dia anteontem)
+/semana — total dos últimos 7 dias
 /grafico — anel kcal + macros + refeições
 /relatorio [semana|mes|N] — gráfico do período
 /lembrete [off|on|HH:MM] — lembrete diário de pesagem (ex: 6:30, 7, 06:35)
 /apagar — remove última refeição
 /buscar &lt;termo&gt; — busca alimento
-/modelo [slug] — troca modelo de visão
 /reset — nova conversa
 
 <b>Marcadores:</b>
@@ -101,6 +101,7 @@ COMMANDS_HELP_WHATSAPP = """\
 /apagar — remove última refeição
 /buscar <termo> — busca alimento
 /reset — nova conversa
+
 
 *Marcadores:*
 ✅ TACO   🌿 Vitat   🟡 estimativa   ❌ sem dados
@@ -186,6 +187,100 @@ async def cmd_hoje(user_id: int, args: list[str]) -> CommandResult:
         Suggestion(label="🗑 Apagar última", command="/apagar"),
     ]
     return CommandResult(text=text, suggestions=suggestions)
+
+
+# ============================================================
+# /dia e /ontem — refeições de um dia específico (retroativo)
+# ============================================================
+
+async def cmd_dia(user_id: int, args: list[str]) -> CommandResult:
+    """`/dia` (sem args) = hoje. `/dia ontem`, `/dia 23/05`, `/dia 2026-05-23`."""
+    from zoneinfo import ZoneInfo
+    from agent.time_parse import parse_date_pt
+    profile = await db.get_profile(user_id) or {}
+    tz_name = profile.get("timezone") or "America/Sao_Paulo"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("America/Sao_Paulo")
+    today_local = datetime.now(tz).date()
+
+    if not args:
+        target = today_local
+    else:
+        target = parse_date_pt(" ".join(args), ref_today=today_local)
+        if target is None:
+            return CommandResult(text=(
+                "Não entendi a data. Exemplos:\n"
+                "  <code>/dia</code> — hoje\n"
+                "  <code>/dia ontem</code>\n"
+                "  <code>/dia anteontem</code>\n"
+                "  <code>/dia 23/05</code>\n"
+                "  <code>/dia 2026-05-23</code>"
+            ))
+
+    meals = await db.list_meals_on_date(user_id, target, tz_name)
+    exercises = await db.list_exercises_on_date(user_id, target, tz_name)
+
+    label_date = target.strftime("%d/%m/%Y")
+    if target == today_local:
+        label = f"Hoje ({label_date})"
+    elif target == today_local - timedelta(days=1):
+        label = f"Ontem ({label_date})"
+    elif target == today_local - timedelta(days=2):
+        label = f"Anteontem ({label_date})"
+    else:
+        label = label_date
+
+    if not meals and not exercises:
+        return CommandResult(text=f"<b>{label}</b>\nNada registrado.")
+
+    lines = [f"<b>{label}</b>"]
+    tot_k = tot_p = tot_c = tot_f = 0.0
+    if meals:
+        lines.append(f"\n🍽 <b>Refeições ({len(meals)})</b>")
+        for m in meals:
+            items = m["items"] if isinstance(m["items"], list) else json.loads(m["items"])
+            names = ", ".join(i.get("food_name") or i["name_llm"] for i in items[:3])
+            local_time = m["eaten_at"].astimezone(tz).strftime("%H:%M")
+            lines.append(
+                f"  #{m['id']}  {local_time}  {_esc(names)}  — {float(m['kcal']):.0f} kcal"
+            )
+            tot_k += float(m["kcal"]); tot_p += float(m["protein_g"])
+            tot_c += float(m["carbs_g"]); tot_f += float(m["fat_g"])
+        lines.append(
+            f"  🔥 <b>{tot_k:.0f} kcal</b> · "
+            f"P {tot_p:.0f}  C {tot_c:.0f}  G {tot_f:.0f}"
+        )
+
+    if exercises:
+        tot_burn = sum(int(e["kcal_burned"]) for e in exercises)
+        lines.append(f"\n🏃 <b>Exercícios ({len(exercises)})</b>")
+        for e in exercises:
+            local_time = e["done_at"].astimezone(tz).strftime("%H:%M")
+            dur = f", {e['duration_min']}min" if e.get("duration_min") else ""
+            lines.append(
+                f"  #{e['id']}  {local_time}  {_esc(e['activity'])}{dur}  "
+                f"— {e['kcal_burned']} kcal"
+            )
+        lines.append(f"  🔥 Queimadas: <b>{tot_burn}</b> kcal")
+
+    suggestions = []
+    if target == today_local:
+        suggestions = [
+            Suggestion(label="📊 Gráfico", command="/grafico"),
+            Suggestion(label="🗑 Apagar última", command="/apagar"),
+        ]
+    else:
+        # Pra dias passados, sugere mostrar gráfico de outro período
+        suggestions = [Suggestion(label="📈 Relatório semana", command="/relatorio semana")]
+
+    return CommandResult(text="\n".join(lines), suggestions=suggestions)
+
+
+async def cmd_ontem(user_id: int, args: list[str]) -> CommandResult:
+    """Atalho pra /dia ontem."""
+    return await cmd_dia(user_id, ["ontem"])
 
 
 # ============================================================
@@ -364,19 +459,6 @@ async def cmd_buscar(user_id: int, args: list[str]) -> CommandResult:
 
 
 # ============================================================
-# /modelo — só lê (set não funciona fora do Telegram)
-# ============================================================
-
-async def cmd_modelo_show(user_id: int, args: list[str]) -> CommandResult:
-    """Versão somente-leitura de /modelo (não dá pra alterar via WhatsApp pq
-    estado em memória do Telegram não é compartilhado). Pra trocar de canal,
-    use /modelo no Telegram."""
-    vision = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash")
-    chat = os.environ.get("OPENROUTER_CHAT_MODEL", "deepseek/deepseek-chat-v3.1:free")
-    return CommandResult(text=f"Visão: {vision}\nChat (agente): {chat}")
-
-
-# ============================================================
 # Dispatcher
 # ============================================================
 
@@ -387,6 +469,8 @@ COMMAND_HANDLERS = {
     "help": cmd_ajuda,
     "perfil": cmd_perfil,
     "hoje": cmd_hoje,
+    "dia": cmd_dia,
+    "ontem": cmd_ontem,
     "semana": cmd_semana,
     "apagar": cmd_apagar,
     "grafico": cmd_grafico,
@@ -394,7 +478,6 @@ COMMAND_HANDLERS = {
     "lembrete": cmd_lembrete,
     "reset": cmd_reset,
     "buscar": cmd_buscar,
-    "modelo": cmd_modelo_show,  # WhatsApp usa essa (read-only); Telegram tem a versão dele
 }
 
 

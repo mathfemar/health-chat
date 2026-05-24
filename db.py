@@ -86,13 +86,15 @@ async def insert_meal(
     items: list[dict],
     totals: dict,
     notes: str | None,
+    eaten_at: datetime | None = None,
 ) -> int:
+    """eaten_at: timestamptz da refeição. None = now() (default do DB)."""
     async with pool().acquire() as conn:
         row = await conn.fetchrow(
             """
             insert into meals (user_id, vision_model, photo_file_id, items,
-                               kcal, protein_g, carbs_g, fat_g, notes)
-            values ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9)
+                               kcal, protein_g, carbs_g, fat_g, notes, eaten_at)
+            values ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9, coalesce($10, now()))
             returning id
             """,
             user_id,
@@ -104,6 +106,7 @@ async def insert_meal(
             totals["carbs_g"],
             totals["fat_g"],
             notes,
+            eaten_at,
         )
     return row["id"]
 
@@ -685,3 +688,116 @@ async def close_active_conversation(user_id: int) -> None:
             "update conversations set state='closed' where user_id=$1 and state='active'",
             user_id,
         )
+
+
+# ============================================================
+# Pending proposal (estado entre turnos do agente)
+# ============================================================
+# Vive em conversations.scratchpad['pending_proposal']. Só UMA proposta por vez
+# por conversa — nova substitui antiga. Estrutura:
+#   {kind: 'meal'|'exercise'|'weight', id: str, ...campos_específicos,
+#    eaten_at_iso: str|None, created_at_iso: str}
+async def get_pending_proposal(conv_id: int) -> dict | None:
+    async with pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "select scratchpad from conversations where id=$1", conv_id
+        )
+    if not row:
+        return None
+    sp = row["scratchpad"] if isinstance(row["scratchpad"], dict) else json.loads(row["scratchpad"] or "{}")
+    return sp.get("pending_proposal")
+
+
+async def set_pending_proposal(conv_id: int, proposal: dict) -> None:
+    async with pool().acquire() as conn:
+        await conn.execute(
+            """
+            update conversations
+            set scratchpad = scratchpad || jsonb_build_object('pending_proposal', $1::jsonb)
+            where id=$2
+            """,
+            json.dumps(proposal), conv_id,
+        )
+
+
+async def clear_pending_proposal(conv_id: int) -> None:
+    async with pool().acquire() as conn:
+        await conn.execute(
+            "update conversations set scratchpad = scratchpad - 'pending_proposal' where id=$1",
+            conv_id,
+        )
+
+
+async def get_pending_proposal_for_user(user_id: int) -> tuple[int, dict] | None:
+    """Versão por user_id — pega da conversa ativa. Retorna (conv_id, proposal) ou None."""
+    async with pool().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            select id, scratchpad from conversations
+            where user_id=$1 and state='active'
+            order by last_at desc limit 1
+            """,
+            user_id,
+        )
+    if not row:
+        return None
+    sp = row["scratchpad"] if isinstance(row["scratchpad"], dict) else json.loads(row["scratchpad"] or "{}")
+    proposal = sp.get("pending_proposal")
+    if not proposal:
+        return None
+    return row["id"], proposal
+
+
+# ============================================================
+# Refeições de um dia específico (usado por /dia e /ontem)
+# ============================================================
+async def list_meals_on_date(user_id: int, target_date, tz_name: str | None = None) -> list[dict]:
+    """target_date: datetime.date no fuso do user. tz_name: IANA, opcional (default = perfil do user)."""
+    from zoneinfo import ZoneInfo
+    if tz_name is None:
+        tz_name = await _user_tz(user_id)
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("America/Sao_Paulo")
+    start_local = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=tz)
+    end_local = start_local + timedelta(days=1)
+    start_utc = start_local.astimezone(timezone.utc)
+    end_utc = end_local.astimezone(timezone.utc)
+    async with pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            select id, items, kcal, protein_g, carbs_g, fat_g, eaten_at, notes
+            from meals
+            where user_id=$1 and eaten_at >= $2 and eaten_at < $3
+            order by eaten_at
+            """,
+            user_id, start_utc, end_utc,
+        )
+    return [dict(r) for r in rows]
+
+
+async def list_exercises_on_date(user_id: int, target_date, tz_name: str | None = None) -> list[dict]:
+    """Idem list_meals_on_date, pra exercises."""
+    from zoneinfo import ZoneInfo
+    if tz_name is None:
+        tz_name = await _user_tz(user_id)
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("America/Sao_Paulo")
+    start_local = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=tz)
+    end_local = start_local + timedelta(days=1)
+    start_utc = start_local.astimezone(timezone.utc)
+    end_utc = end_local.astimezone(timezone.utc)
+    async with pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            select id, activity, kcal_burned, duration_min, done_at
+            from exercises
+            where user_id=$1 and done_at >= $2 and done_at < $3
+            order by done_at
+            """,
+            user_id, start_utc, end_utc,
+        )
+    return [dict(r) for r in rows]

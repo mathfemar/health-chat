@@ -23,6 +23,8 @@ Intent = Literal[
     "log_exercise",
     "query_status",
     "onboarding",
+    "confirm_pending",
+    "cancel_pending",
     "free_chat",
 ]
 
@@ -41,12 +43,18 @@ class RoutingDecision:
 # Mapa canônico — fácil revisar/expandir
 INTENT_TOOL_SETS: dict[str, set[str]] = {
     "log_meal_now": {
-        "estimate_meal_from_photo", "log_meal",
+        "estimate_meal_from_photo", "propose_meal", "log_meal",
         "search_foods", "search_vitat", "fetch_vitat_food",
         "get_food_portions", "save_food_alias",
         "save_meal_template",
         "get_user_profile", "get_calorie_balance",
         "generate_daily_chart",
+    },
+    "confirm_pending": {
+        "confirm_proposal", "cancel_proposal",
+    },
+    "cancel_pending": {
+        "cancel_proposal",
     },
     "log_template": {
         "list_meal_templates", "log_template",
@@ -116,6 +124,16 @@ INTENT_ADDENDUMS: dict[str, str] = {
         "[Intent: query_status] Usuário quer status do dia/semana. "
         "Use get_calorie_balance + get_today_summary. Responda direto."
     ),
+    "confirm_pending": (
+        "[Intent: confirm_pending] Existe proposta pendente E o user confirmou. "
+        "Chame confirm_proposal() — ele lê os dados exatos do scratchpad e loga. "
+        "NÃO re-busque alimentos, NÃO recalcule. Após confirmar, escreva uma "
+        "linha curta tipo '✅ Logado'."
+    ),
+    "cancel_pending": (
+        "[Intent: cancel_pending] User cancelou a proposta pendente. "
+        "Chame cancel_proposal() e responda 'Ok, cancelei.'."
+    ),
 }
 
 
@@ -157,12 +175,41 @@ _KEYWORDS_ONBOARDING = re.compile(
 )
 _WEIGHT_ONLY = re.compile(r"^\s*\d{2,3}([.,]\d)?\s*(kg)?\s*$", re.IGNORECASE)
 
+# Confirmação / cancelamento de proposta pendente. Match curto/exato pra não
+# falsa-positivar em frases longas ("sim, e além disso comi X" não é confirm).
+_KEYWORDS_CONFIRM = re.compile(
+    r"^\s*("
+    r"sim|s|ok|okay|isso|certo|confirma|confirmo|confirmar|"
+    r"pode|pode\s+ser|pode\s+logar|pode\s+salvar|"
+    r"loga|logar|salva|salvar|registra|registrar|"
+    r"t[áa]\s+(bom|certo|ok)|beleza|blz|valeu|"
+    r"manda\s+bala|vai|✅"
+    r")\s*[.!👍✅]?\s*$",
+    re.IGNORECASE,
+)
+_KEYWORDS_CANCEL = re.compile(
+    r"^\s*("
+    r"n[ãa]o|nao|n|cancela|cancelar|errado|errei|deixa\s+pra\s+l[áa]|"
+    r"esquece|ignora|❌|👎"
+    r")\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
 
-def classify_text(text: str) -> tuple[Intent | None, float]:
-    """Retorna (intent_sugerido, confiança) só por texto. None = não decidiu."""
+
+def classify_text(text: str, has_pending: bool = False) -> tuple[Intent | None, float]:
+    """Retorna (intent_sugerido, confiança) só por texto. None = não decidiu.
+
+    has_pending: se True (há proposal_proposal no scratchpad), 'sim/não' viram
+    intents fortes de confirm/cancel. Sem pending, 'sim' isolado é ambíguo demais."""
     if not text or not text.strip():
         return None, 0.0
     s = text.strip()
+    # Confirmação/cancelamento têm prioridade quando há algo pendente
+    if has_pending:
+        if _KEYWORDS_CONFIRM.match(s):
+            return "confirm_pending", 0.95
+        if _KEYWORDS_CANCEL.match(s):
+            return "cancel_pending", 0.92
     if _WEIGHT_ONLY.match(s):
         return "log_weight", 0.95
     if _KEYWORDS_ONBOARDING.search(s):
@@ -256,9 +303,18 @@ async def classify(
     photo_bytes: bytes | None,
     history: list[dict],
     vision_model: str,
+    pending_kind: str | None = None,
 ) -> RoutingDecision:
-    """Combina sinais de texto + imagem e devolve RoutingDecision."""
-    text_intent, text_conf = classify_text(text or "")
+    """Combina sinais de texto + imagem e devolve RoutingDecision.
+
+    pending_kind: 'meal'|'exercise'|'weight'|None. Quando há proposta pendente
+    no scratchpad, ajustes:
+      - 'sim/não' isolado vira confirm_pending/cancel_pending com conf alta
+      - foto isolada sem texto NÃO interrompe a confirmação (user pode mandar
+        algo não relacionado, mas se é uma resposta curta confirmatória, vence)
+    """
+    has_pending = pending_kind is not None
+    text_intent, text_conf = classify_text(text or "", has_pending=has_pending)
 
     image_kind, image_conf = (None, 0.0)
     if photo_bytes:
@@ -288,12 +344,13 @@ async def classify(
             "image_kind": image_kind,
             "image_conf": image_conf,
             "bot_last": bot_last,
+            "pending_kind": pending_kind,
         },
     )
     log.info(
-        "[router] intent=%s conf=%.2f allowed=%s (text=%s img=%s)",
+        "[router] intent=%s conf=%.2f allowed=%s (text=%s img=%s pending=%s)",
         intent, conf,
         f"{len(allowed)} tools" if allowed else "ALL",
-        text_intent, image_kind,
+        text_intent, image_kind, pending_kind,
     )
     return decision

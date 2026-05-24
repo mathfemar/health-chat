@@ -118,8 +118,27 @@ async def _post_openrouter(payload: dict) -> dict:
 
 
 async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
-                   download_photo, vision_model: str) -> str:
-    """Executa um turno completo. Retorna o texto pra mandar ao usuário."""
+                   download_photo, vision_model: str,
+                   on_stage=None) -> str:
+    """Executa um turno completo. Retorna o texto pra mandar ao usuário.
+
+    on_stage: callable opcional (async ou sync). Recebe string identificando
+    o estágio atual — usado pra mostrar 'Pensando...', 'Buscando alimento...',
+    etc. ao usuário. Valores possíveis:
+      'downloading_photo' | 'routing' | 'thinking' | 'thinking_more' |
+      'finalizing' | 'tool:<nome_da_tool>'
+    Erros do callback são engolidos (não-críticos).
+    """
+    async def _stage(name: str) -> None:
+        if on_stage is None:
+            return
+        try:
+            res = on_stage(name)
+            if hasattr(res, "__await__"):
+                await res
+        except Exception:
+            log.debug("on_stage(%r) raised — ignorado", name, exc_info=True)
+
     conv = await get_or_create_conversation(user_id)
     conv_id = conv["id"]
 
@@ -134,16 +153,22 @@ async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
     # Baixa foto UMA vez aqui (router precisa, tools reaproveitam via ctx)
     photo_bytes: bytes | None = None
     if photo_file_id:
+        await _stage("downloading_photo")
         try:
             photo_bytes = await download_photo(photo_file_id)
         except Exception:
             log.exception("falha baixando foto pro router")
+    await _stage("routing")
     history_for_router = await _load_messages(conv_id)
+    # Lê estado pendente (proposta de refeição/etc) pra router decidir certo
+    pending = await db.get_pending_proposal(conv_id)
+    pending_kind = pending.get("kind") if pending else None
     decision = await nlu_router.classify(
         text=user_text or "",
         photo_bytes=photo_bytes,
         history=history_for_router,
         vision_model=vision_model,
+        pending_kind=pending_kind,
     )
 
     # 2. monta payload base (com addendum do router quando aplicável)
@@ -151,6 +176,10 @@ async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
     system_blocks = [prompts.SYSTEM_PROMPT]
     if decision.system_addendum:
         system_blocks.append(decision.system_addendum)
+    # Se há proposta pendente, exponha pro LLM (assim ele consegue responder
+    # ajustes textuais tipo "muda pra 150g" sem se perder)
+    if pending:
+        system_blocks.append(_format_pending_block(pending))
     # Pré-carrega templates de refeição do user (até 10 mais usados)
     try:
         templates = await db.list_meal_templates(user_id, limit=10)
@@ -206,6 +235,15 @@ async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
                 "content": "[Limite de tool calls atingido. RESPONDA AGORA ao usuário em texto, com o que você já sabe. Não chame mais tools.]"
             })
 
+        # Sinal pro user: 'pensando' (step 0) ou 'pensando mais' (subsequentes)
+        # ou 'finalizando' (último turno forçado)
+        if force_final:
+            await _stage("finalizing")
+        elif step == 0:
+            await _stage("thinking")
+        else:
+            await _stage("thinking_more")
+
         try:
             raw = await _post_openrouter(payload)
         except Exception as e:
@@ -238,6 +276,7 @@ async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
             except json.JSONDecodeError:
                 args = {}
             log.info("[agent] tool: %s(%s)", name, args)
+            await _stage(f"tool:{name}")
             try:
                 result = await registry.call(name, args, ctx)
             except Exception as e:
@@ -255,6 +294,34 @@ async def run_turn(user_id: int, user_text: str, photo_file_id: str | None,
     return final_text
 
 
+def _format_pending_block(p: dict) -> str:
+    """Resumo da proposta pendente, injetado no system prompt do turno."""
+    kind = p.get("kind", "?")
+    if kind == "meal":
+        totals = p.get("totals") or {}
+        items = p.get("items") or []
+        lines = [
+            "[Proposta pendente — kind=meal] Já existe uma refeição AGUARDANDO confirmação.",
+            f"  Total: {totals.get('kcal', 0):.0f} kcal · P {totals.get('protein_g', 0):.0f}g",
+            f"  Itens: {len(items)} — " + ", ".join(
+                f"{it.get('name_llm', '?')} {it.get('portion_g', 0):.0f}g"
+                for it in items[:4]
+            ),
+        ]
+        if p.get("eaten_at_iso"):
+            lines.append(f"  Comida em: {p['eaten_at_iso']}")
+        lines.append(
+            "REGRAS quando há proposta pendente:\n"
+            "  • Se user confirmou ('sim/loga/ok') → chame confirm_proposal()\n"
+            "  • Se user cancelou ('não/cancela') → chame cancel_proposal()\n"
+            "  • Se user pediu ajuste ('muda pra 150g', 'adiciona X', 'tira Y') →\n"
+            "    chame propose_meal() de novo com os items corrigidos (sobrescreve).\n"
+            "  • Se user mudou de assunto → ignore a proposta (ela continua pendente)."
+        )
+        return "\n".join(lines)
+    return f"[Proposta pendente — kind={kind}]"
+
+
 def _synthesize_fallback_text(tool_history: list[tuple[str, dict, dict]]) -> str:
     """Quando o modelo executa ações mas esquece de escrever texto final,
     montamos uma confirmação a partir do que realmente aconteceu."""
@@ -265,13 +332,20 @@ def _synthesize_fallback_text(tool_history: list[tuple[str, dict, dict]]) -> str
     for name, _args, result in reversed(tool_history):
         if not isinstance(result, dict) or result.get("error"):
             continue
-        if name == "log_meal":
+        if name in ("log_meal", "confirm_proposal"):
             totals = result.get("totals", {})
             kcal = totals.get("kcal", 0)
             p = totals.get("protein_g", 0)
             mid = result.get("meal_id", "?")
             return (f"✅ Refeição #{mid} logada: <b>{kcal:.0f} kcal</b> "
                     f"({p:.0f}g proteína).")
+        if name == "propose_meal":
+            totals = result.get("totals", {})
+            return (f"Proposta criada: <b>{totals.get('kcal', 0):.0f} kcal</b> "
+                    f"({totals.get('protein_g', 0):.0f}g proteína). "
+                    "Confirma logar?")
+        if name == "cancel_proposal":
+            return "Ok, cancelei."
         if name == "log_exercise":
             return (f"✅ Exercício registrado: <b>{result.get('activity','?')}</b> "
                     f"— {result.get('kcal_burned','?')} kcal queimadas.")

@@ -333,7 +333,6 @@ Por default o adapter valida `X-Twilio-Signature` em todo POST (descarta request
 | `/relatorio [semana\|mes\|N]` | Gráfico de intake vs queimado vs meta no período |
 | `/lembrete [off\|on\|0-23]` | Configura lembrete diário de pesagem (default 6h) |
 | `/buscar <termo>` | Busca alimento no banco local (TACO + Vitat cacheado) |
-| `/modelo [slug]` | Vê ou troca o modelo de visão em runtime |
 | `/apagar` | Remove a última refeição |
 | `/reset` | Começa nova conversa com o agente (zera histórico) |
 

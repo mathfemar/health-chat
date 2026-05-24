@@ -168,8 +168,9 @@ def _guard(update: Update) -> bool:
     return u is not None and u.id == ALLOWED_USER_ID
 
 
-def _current_model(context: ContextTypes.DEFAULT_TYPE) -> str:
-    return context.bot_data.get("model", os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash"))
+def _current_model(_context: ContextTypes.DEFAULT_TYPE | None = None) -> str:
+    """Modelo de visão lido do env. Não-configurável em runtime."""
+    return os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash")
 
 
 def _source_emoji(source: str) -> str:
@@ -207,6 +208,141 @@ def _meal_keyboard(meal_id: int, items: list[dict]) -> InlineKeyboardMarkup:
             )])
     rows.append([InlineKeyboardButton("🗑 apagar refeição", callback_data=f"del:{meal_id}")])
     return InlineKeyboardMarkup(rows)
+
+
+# ============================================================
+# Inline keyboard de proposta pendente (refeição aguardando confirmação)
+# ============================================================
+def _proposal_keyboard(proposal_id: str, eaten_at_iso: str | None) -> InlineKeyboardMarkup:
+    """Botões abaixo da mensagem de proposta do agente.
+    [✅ Logar] [🕐 Horário] [❌ Cancelar]
+    """
+    label_time = "🕐 Horário"
+    if eaten_at_iso:
+        # Marca visualmente que já tem horário customizado escolhido
+        label_time = "🕐 Horário ✓"
+    rows = [
+        [
+            InlineKeyboardButton("✅ Logar", callback_data=f"cf:{proposal_id}"),
+            InlineKeyboardButton(label_time, callback_data=f"tp:{proposal_id}"),
+            InlineKeyboardButton("❌ Cancelar", callback_data=f"cn:{proposal_id}"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _time_picker_keyboard(proposal_id: str) -> InlineKeyboardMarkup:
+    """Sub-teclado de escolha rápida de horário. Selectionar volta pro kb principal."""
+    rows = [
+        [
+            InlineKeyboardButton("Agora", callback_data=f"tps:{proposal_id}:0"),
+            InlineKeyboardButton("1h atrás", callback_data=f"tps:{proposal_id}:60"),
+            InlineKeyboardButton("3h atrás", callback_data=f"tps:{proposal_id}:180"),
+        ],
+        [
+            InlineKeyboardButton("Ontem 12h", callback_data=f"tps:{proposal_id}:y12"),
+            InlineKeyboardButton("Ontem 19h", callback_data=f"tps:{proposal_id}:y19"),
+        ],
+        [
+            InlineKeyboardButton("✍️ Digitar horário", callback_data=f"tpc:{proposal_id}"),
+            InlineKeyboardButton("⬅️ Voltar", callback_data=f"tpb:{proposal_id}"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+# ============================================================
+# Indicador "Pensando..." — labels por estágio do run_turn
+# ============================================================
+# Estágios fixos do runtime (não-tool)
+_STAGE_LABELS: dict[str, str] = {
+    "downloading_photo": "📷 <i>Baixando foto...</i>",
+    "routing":           "🧭 <i>Entendendo seu pedido...</i>",
+    "thinking":          "🤔 <i>Pensando...</i>",
+    "thinking_more":     "🤔 <i>Continuando o raciocínio...</i>",
+    "finalizing":        "✏️ <i>Fechando a resposta...</i>",
+}
+
+# Labels humanizados por tool. Default em _default_tool_label.
+_TOOL_LABELS: dict[str, str] = {
+    # Visão
+    "estimate_meal_from_photo": "🔍 <i>Analisando foto do prato...</i>",
+    "parse_menu":               "📋 <i>Lendo cardápio...</i>",
+    "parse_scale_photo":        "⚖️ <i>Lendo a balança...</i>",
+    "parse_watch_photo":        "🏃 <i>Lendo relógio fitness...</i>",
+    # Banco de alimentos
+    "search_foods":             "🔎 <i>Buscando no banco local...</i>",
+    "search_vitat":             "🌿 <i>Procurando no Vitat...</i>",
+    "fetch_vitat_food":         "🌿 <i>Baixando alimento do Vitat...</i>",
+    "get_food_portions":        "📏 <i>Listando porções...</i>",
+    "save_food_alias":          "📚 <i>Salvando alias do alimento...</i>",
+    # Refeição
+    "propose_meal":             "📝 <i>Montando proposta de refeição...</i>",
+    "confirm_proposal":         "✅ <i>Confirmando refeição...</i>",
+    "cancel_proposal":          "❌ <i>Cancelando proposta...</i>",
+    "log_meal":                 "💾 <i>Registrando refeição...</i>",
+    "save_meal_template":       "💾 <i>Salvando template de refeição...</i>",
+    "list_meal_templates":      "📋 <i>Buscando refeições salvas...</i>",
+    "log_template":             "💾 <i>Logando template...</i>",
+    # Peso / treino
+    "log_weight":               "⚖️ <i>Salvando peso...</i>",
+    "log_exercise":             "🏃 <i>Salvando treino...</i>",
+    "get_exercises_today":      "🏃 <i>Listando treinos de hoje...</i>",
+    # Perfil / meta
+    "get_user_profile":         "👤 <i>Lendo seu perfil...</i>",
+    "set_profile":              "👤 <i>Atualizando perfil...</i>",
+    "compute_daily_goal":       "🎯 <i>Calculando sua meta...</i>",
+    "get_bot_capabilities":     "📖 <i>Consultando capacidades...</i>",
+    # Status / agregados
+    "get_today_summary":        "📊 <i>Lendo dados do dia...</i>",
+    "get_calorie_balance":      "📊 <i>Calculando seu balanço...</i>",
+    "get_recent_meals":         "📊 <i>Buscando refeições recentes...</i>",
+    "get_period_summary":       "📈 <i>Resumindo o período...</i>",
+    "compare_to_goal":          "📊 <i>Comparando com a meta...</i>",
+    # Gráficos
+    "generate_daily_chart":     "📊 <i>Desenhando gráfico do dia...</i>",
+    "generate_weight_chart":    "📈 <i>Desenhando gráfico de peso...</i>",
+    "generate_report_chart":    "📈 <i>Desenhando relatório...</i>",
+    # Memória
+    "remember":                 "🧠 <i>Anotando contexto...</i>",
+}
+
+
+def _default_tool_label(tool_name: str) -> str:
+    """Fallback se aparecer uma tool nova sem entrada em _TOOL_LABELS."""
+    # quebra snake_case em palavras pra ficar legível
+    pretty = tool_name.replace("_", " ").strip()
+    return f"🔧 <i>Executando {pretty}...</i>"
+
+
+def _label_for_stage(stage: str) -> str:
+    """Resolve o label HTML pra um identificador de estágio do runtime."""
+    if stage.startswith("tool:"):
+        name = stage[5:]
+        return _TOOL_LABELS.get(name) or _default_tool_label(name)
+    return _STAGE_LABELS.get(stage, "🤔 <i>Pensando...</i>")
+
+
+def _compute_offset_dt(token: str, user_tz_name: str):
+    """Converte token do callback ('0', '60', '180', 'y12', 'y19') em datetime aware.
+    Retorna None se inválido."""
+    from datetime import datetime as _dt, timedelta as _td
+    from zoneinfo import ZoneInfo as _ZI
+    try:
+        tz = _ZI(user_tz_name)
+    except Exception:
+        tz = _ZI("America/Sao_Paulo")
+    now = _dt.now(tz)
+    if token == "0":
+        return now
+    if token.isdigit():
+        return now - _td(minutes=int(token))
+    if token.startswith("y") and token[1:].isdigit():
+        h = int(token[1:])
+        if 0 <= h <= 23:
+            yest = now.date() - _td(days=1)
+            return _dt.combine(yest, _dt.min.time(), tzinfo=tz).replace(hour=h)
+    return None
 
 
 # ============================================================
@@ -251,20 +387,6 @@ async def cmd_ajuda(update: Update, _) -> None:
     await _send_result(update, r, reply_markup=MAIN_KB)
 
 
-async def cmd_modelo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Telegram-only: aceita escrita (atualiza bot_data em memória)."""
-    if not _guard(update): return
-    if context.args:
-        new = " ".join(context.args).strip()
-        context.bot_data["model"] = new
-        await update.message.reply_text(f"Modelo de visão agora: {new}")
-    else:
-        await update.message.reply_text(
-            f"Visão: {_current_model(context)}\n"
-            f"Chat (agente): {os.environ.get('OPENROUTER_CHAT_MODEL', 'deepseek/deepseek-chat-v3.1:free')}"
-        )
-
-
 async def cmd_buscar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _guard(update): return
     r = await commands.cmd_buscar(update.effective_user.id, list(context.args or []))
@@ -286,6 +408,18 @@ async def cmd_semana(update: Update, _) -> None:
 async def cmd_apagar(update: Update, _) -> None:
     if not _guard(update): return
     r = await commands.cmd_apagar(update.effective_user.id, [])
+    await _send_result(update, r)
+
+
+async def cmd_dia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _guard(update): return
+    r = await commands.cmd_dia(update.effective_user.id, list(context.args or []))
+    await _send_result(update, r)
+
+
+async def cmd_ontem(update: Update, _) -> None:
+    if not _guard(update): return
+    r = await commands.cmd_ontem(update.effective_user.id, [])
     await _send_result(update, r)
 
 
@@ -583,7 +717,79 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if handler:
         await handler(update, context)
         return
+    # Se há proposta esperando horário customizado, parse aqui (sem agente)
+    if await _maybe_handle_awaited_time(update, text):
+        return
     await _agent_handle(update, context, text=text, photo_file_id=None)
+
+
+async def _maybe_handle_awaited_time(update: Update, text: str) -> bool:
+    """Se a conversa tem `awaiting_time_for=<proposal_id>` no scratchpad,
+    parse o texto como horário, atualiza a proposta e re-mostra o kb principal.
+    Retorna True se consumiu a mensagem."""
+    from agent.time_parse import parse_time_pt
+    from zoneinfo import ZoneInfo as _ZI
+
+    user_id = update.effective_user.id
+    pool = db.pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            select id, scratchpad from conversations
+            where user_id=$1 and state='active'
+            order by last_at desc limit 1
+            """,
+            user_id,
+        )
+    if not row:
+        return False
+    sp = row["scratchpad"] if isinstance(row["scratchpad"], dict) else json.loads(row["scratchpad"] or "{}")
+    proposal_id = sp.get("awaiting_time_for")
+    if not proposal_id:
+        return False
+    conv_id = row["id"]
+    proposal = sp.get("pending_proposal")
+    if not proposal or proposal.get("id") != proposal_id:
+        # Limpa flag órfã
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "update conversations set scratchpad = scratchpad - 'awaiting_time_for' where id=$1",
+                conv_id,
+            )
+        return False
+
+    profile = await db.get_profile(user_id) or {}
+    tz_name = profile.get("timezone") or "America/Sao_Paulo"
+    try:
+        tz = _ZI(tz_name)
+    except Exception:
+        tz = _ZI("America/Sao_Paulo")
+    parsed = parse_time_pt(text, tz)
+    if parsed is None:
+        await update.message.reply_text(
+            "Não entendi o horário. Tenta: 'ontem 19h', '23/05 12h', 'há 2 horas'.\n"
+            "(Ou clica num dos atalhos no kb da proposta de novo.)",
+        )
+        return True
+
+    proposal["eaten_at_iso"] = parsed.isoformat()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            update conversations
+            set scratchpad = (scratchpad - 'awaiting_time_for')
+                             || jsonb_build_object('pending_proposal', $1::jsonb)
+            where id=$2
+            """,
+            json.dumps(proposal), conv_id,
+        )
+    local = parsed.astimezone(tz)
+    await update.message.reply_text(
+        f"⏰ Horário atualizado: <b>{local.strftime('%d/%m %H:%M')}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_proposal_keyboard(proposal_id, proposal["eaten_at_iso"]),
+    )
+    return True
 
 
 async def _telegram_download_photo(bot, file_id: str) -> bytes | None:
@@ -596,12 +802,37 @@ async def _telegram_download_photo(bot, file_id: str) -> bytes | None:
 
 async def _agent_handle(update: Update, context: ContextTypes.DEFAULT_TYPE,
                         text: str, photo_file_id: str | None) -> None:
-    """Rota pro agente conversacional."""
+    """Rota pro agente conversacional, com feedback de estágios."""
     msg = update.message
     await msg.chat.send_action(ChatAction.TYPING)
 
     async def _dl(pid: str) -> bytes | None:
         return await _telegram_download_photo(context.bot, pid)
+
+    # Mensagem viva que vai sendo editada conforme o runtime dispara estágios.
+    # Começa em "Pensando..." e termina com a resposta real (editada in-place).
+    try:
+        loading_msg = await msg.reply_text(
+            _STAGE_LABELS["thinking"], parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        log.exception("não consegui mandar msg de loading — sigo sem ela")
+        loading_msg = None
+
+    last_label = {"value": _STAGE_LABELS["thinking"]}
+
+    async def _on_stage(stage: str) -> None:
+        if loading_msg is None:
+            return
+        label = _label_for_stage(stage)
+        if label == last_label["value"]:
+            return
+        last_label["value"] = label
+        try:
+            await loading_msg.edit_text(label, parse_mode=ParseMode.HTML)
+        except Exception:
+            # 400 "message is not modified", rate limit, msg deletada pelo user, etc.
+            log.debug("edit loading falhou — ignorado", exc_info=True)
 
     try:
         reply = await agent.run_turn(
@@ -610,24 +841,205 @@ async def _agent_handle(update: Update, context: ContextTypes.DEFAULT_TYPE,
             photo_file_id=photo_file_id,
             download_photo=_dl,
             vision_model=_current_model(context),
+            on_stage=_on_stage,
         )
     except Exception as e:
         log.exception("agent.run_turn failed")
-        await msg.reply_text(f"Agente quebrou: {e}")
+        if loading_msg is not None:
+            try:
+                await loading_msg.edit_text(f"Agente quebrou: {e}")
+            except Exception:
+                await msg.reply_text(f"Agente quebrou: {e}")
+        else:
+            await msg.reply_text(f"Agente quebrou: {e}")
         return
 
     # Converte markdown comum pra HTML (Gemma às vezes escapa do prompt)
-    reply = _md_to_html(reply)
-    try:
-        await msg.reply_text(reply, parse_mode=ParseMode.HTML)
-    except Exception:
-        await msg.reply_text(reply)
+    reply = _md_to_html(reply) or "(sem resposta)"
+
+    # Se há proposta pendente NOVA (vinda do propose_meal deste turno),
+    # anexa inline kb [✅ Logar] [🕐 Horário] [❌ Cancelar]
+    conv = await agent.get_or_create_conversation(update.effective_user.id)
+    pending = await db.get_pending_proposal(conv["id"])
+    markup = None
+    if pending and pending.get("kind") == "meal":
+        markup = _proposal_keyboard(pending["id"], pending.get("eaten_at_iso"))
+
+    # Edita a msg de loading com a resposta final (mais limpo que apagar+mandar).
+    # Fallback: se edit falhar (msg muito longa, foi apagada, etc), manda nova.
+    sent_via_edit = False
+    if loading_msg is not None:
+        try:
+            await loading_msg.edit_text(
+                reply, parse_mode=ParseMode.HTML, reply_markup=markup,
+            )
+            sent_via_edit = True
+        except Exception:
+            log.debug("edit final falhou — vou mandar msg nova", exc_info=True)
+            try:
+                await loading_msg.delete()
+            except Exception:
+                pass
+    if not sent_via_edit:
+        try:
+            await msg.reply_text(reply, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception:
+            await msg.reply_text(reply, reply_markup=markup)
 
     # Se o agente gerou um gráfico (via generate_report_chart), envia agora
-    conv = await agent.get_or_create_conversation(update.effective_user.id)
     chart_bytes = await db.pop_pending_chart(conv["id"])
     if chart_bytes:
         await msg.reply_photo(photo=io.BytesIO(chart_bytes))
+
+
+# ============================================================
+# Callbacks de proposta (estado em scratchpad, zero LLM no caminho)
+# ============================================================
+async def _callback_confirm_proposal(q, user_id: int, proposal_id: str) -> None:
+    """Loga a proposta pendente direto, sem agente. Lê items do scratchpad,
+    chama db.insert_meal com o eaten_at salvo, limpa scratchpad."""
+    from datetime import datetime as _dt
+    result = await db.get_pending_proposal_for_user(user_id)
+    if not result:
+        await q.edit_message_text(
+            (q.message.text_html or q.message.text or "") +
+            "\n\n<i>⏳ Proposta expirou — refaça.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    conv_id, proposal = result
+    if proposal.get("id") != proposal_id:
+        await q.answer("Esta proposta foi substituída.", show_alert=True)
+        return
+    if proposal.get("kind") != "meal":
+        await q.answer("Tipo de proposta desconhecido.", show_alert=True)
+        return
+
+    eaten_at = None
+    iso = proposal.get("eaten_at_iso")
+    if iso:
+        try:
+            eaten_at = _dt.fromisoformat(iso.replace("Z", "+00:00"))
+        except ValueError:
+            eaten_at = None
+
+    meal_id = await db.insert_meal(
+        user_id=user_id, vision_model="agent-proposal",
+        photo_file_id=None,
+        items=proposal["items"], totals=proposal["totals"],
+        notes=proposal.get("notes"),
+        eaten_at=eaten_at,
+    )
+    await db.clear_pending_proposal(conv_id)
+
+    # Mostra confirmação na mesma mensagem
+    tot = proposal["totals"]
+    when = ""
+    if eaten_at:
+        # Pega tz do user pra renderizar bonito
+        from zoneinfo import ZoneInfo as _ZI
+        try:
+            profile = await db.get_profile(user_id) or {}
+            tz = _ZI(profile.get("timezone") or "America/Sao_Paulo")
+            local = eaten_at.astimezone(tz)
+            when = f" em {local.strftime('%d/%m %H:%M')}"
+        except Exception:
+            when = f" em {eaten_at.isoformat()}"
+
+    confirmation = (
+        f"✅ <b>Refeição #{meal_id}</b> logada{when}\n"
+        f"🔥 {tot['kcal']:.0f} kcal · "
+        f"P {tot['protein_g']:.0f}  C {tot['carbs_g']:.0f}  G {tot['fat_g']:.0f}"
+    )
+    # Substitui o conteúdo + remove botões
+    try:
+        await q.edit_message_text(confirmation, parse_mode=ParseMode.HTML)
+    except Exception:
+        await q.message.reply_text(confirmation, parse_mode=ParseMode.HTML)
+
+    # Anexa gráfico do dia
+    try:
+        from agent.tools import _build_daily_chart
+        png = await _build_daily_chart(user_id)
+        await q.message.reply_photo(photo=io.BytesIO(png))
+    except Exception:
+        log.exception("falha no gráfico após confirm_proposal")
+
+
+async def _callback_cancel_proposal(q, user_id: int, proposal_id: str) -> None:
+    result = await db.get_pending_proposal_for_user(user_id)
+    if result:
+        conv_id, proposal = result
+        if proposal.get("id") == proposal_id:
+            await db.clear_pending_proposal(conv_id)
+    try:
+        await q.edit_message_text(
+            (q.message.text_html or q.message.text or "") +
+            "\n\n<i>❌ Cancelado — nada foi logado.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        await q.message.reply_text("❌ Cancelado.")
+
+
+async def _callback_pick_time(q, user_id: int, proposal_id: str, token: str) -> None:
+    """Atualiza eaten_at_iso da proposta pendente, volta pro kb principal."""
+    result = await db.get_pending_proposal_for_user(user_id)
+    if not result:
+        await q.answer("Proposta expirou.", show_alert=True)
+        return
+    conv_id, proposal = result
+    if proposal.get("id") != proposal_id:
+        await q.answer("Esta proposta foi substituída.", show_alert=True)
+        return
+
+    profile = await db.get_profile(user_id) or {}
+    tz_name = profile.get("timezone") or "America/Sao_Paulo"
+    new_dt = _compute_offset_dt(token, tz_name)
+    if new_dt is None:
+        await q.answer("Horário inválido.", show_alert=True)
+        return
+
+    if token == "0":
+        proposal["eaten_at_iso"] = None  # 'agora' = default no DB
+    else:
+        proposal["eaten_at_iso"] = new_dt.isoformat()
+    await db.set_pending_proposal(conv_id, proposal)
+    # Re-renderiza kb principal mostrando que tem horário escolhido
+    await q.edit_message_reply_markup(
+        reply_markup=_proposal_keyboard(proposal_id, proposal["eaten_at_iso"])
+    )
+    label = "agora" if token == "0" else new_dt.strftime("%d/%m %H:%M")
+    await q.answer(f"Horário: {label}")
+
+
+async def _callback_custom_time(q, user_id: int, proposal_id: str) -> None:
+    """Marca scratchpad pra próxima mensagem de texto ser interpretada como horário."""
+    result = await db.get_pending_proposal_for_user(user_id)
+    if not result:
+        await q.answer("Proposta expirou.", show_alert=True)
+        return
+    conv_id, _ = result
+    # Guarda flag no scratchpad. on_text checa antes de rotear pro agente.
+    pool = db.pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            update conversations
+            set scratchpad = scratchpad || jsonb_build_object('awaiting_time_for', $1::text)
+            where id=$2
+            """,
+            proposal_id, conv_id,
+        )
+    await q.message.reply_text(
+        "✍️ Manda o horário em texto. Aceito:\n"
+        "  • <code>ontem 19h</code>\n"
+        "  • <code>anteontem 12h</code>\n"
+        "  • <code>23/05 19:30</code>\n"
+        "  • <code>há 2 horas</code>\n"
+        "  • <code>2026-05-23T19:00</code>",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 # ============================================================
@@ -758,6 +1170,53 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if data == "noop":
         await q.message.delete()
+        return
+
+    # ============================================================
+    # Proposta pendente — confirm / cancel / time picker
+    # ============================================================
+    if data.startswith("cf:"):
+        proposal_id = data[3:]
+        await _callback_confirm_proposal(q, user_id, proposal_id)
+        return
+
+    if data.startswith("cn:"):
+        proposal_id = data[3:]
+        await _callback_cancel_proposal(q, user_id, proposal_id)
+        return
+
+    if data.startswith("tp:"):
+        # Abre sub-teclado de horário
+        proposal_id = data[3:]
+        await q.edit_message_reply_markup(reply_markup=_time_picker_keyboard(proposal_id))
+        return
+
+    if data.startswith("tpb:"):
+        # Volta pro teclado principal
+        proposal_id = data[4:]
+        result = await db.get_pending_proposal_for_user(user_id)
+        eaten_iso = None
+        if result and result[1].get("id") == proposal_id:
+            eaten_iso = result[1].get("eaten_at_iso")
+        await q.edit_message_reply_markup(
+            reply_markup=_proposal_keyboard(proposal_id, eaten_iso)
+        )
+        return
+
+    if data.startswith("tps:"):
+        # Aplica horário escolhido
+        try:
+            _, proposal_id, token = data.split(":", 2)
+        except ValueError:
+            await q.message.reply_text("Callback inválido.")
+            return
+        await _callback_pick_time(q, user_id, proposal_id, token)
+        return
+
+    if data.startswith("tpc:"):
+        # Pede horário customizado via texto. Marca scratchpad pra próxima msg ser interpretada.
+        proposal_id = data[4:]
+        await _callback_custom_time(q, user_id, proposal_id)
         return
 
 
@@ -1014,9 +1473,10 @@ def _build_telegram_app() -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler(["ajuda", "help"], cmd_ajuda))
     app.add_handler(CommandHandler("hoje", cmd_hoje))
+    app.add_handler(CommandHandler("dia", cmd_dia))
+    app.add_handler(CommandHandler("ontem", cmd_ontem))
     app.add_handler(CommandHandler("semana", cmd_semana))
     app.add_handler(CommandHandler("apagar", cmd_apagar))
-    app.add_handler(CommandHandler("modelo", cmd_modelo))
     app.add_handler(CommandHandler("buscar", cmd_buscar))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("perfil", cmd_perfil))

@@ -22,7 +22,7 @@ from agent import router
 # ============================================================
 # Helpers
 # ============================================================
-async def _classify_with_image(text, image_kind, image_conf=0.9, history=None):
+async def _classify_with_image(text, image_kind, image_conf=0.9, history=None, pending_kind=None):
     """Roda router.classify com image_classifier mockado."""
     with patch("agent.image_classifier.classify",
                 new=AsyncMock(return_value=(image_kind, image_conf))):
@@ -31,14 +31,16 @@ async def _classify_with_image(text, image_kind, image_conf=0.9, history=None):
             photo_bytes=b"fake_image_bytes" if image_kind else None,
             history=history or [],
             vision_model="test-model",
+            pending_kind=pending_kind,
         )
 
 
-async def _classify_text_only(text, history=None):
+async def _classify_text_only(text, history=None, pending_kind=None):
     """Roda router.classify só com texto, sem foto."""
     return await router.classify(
         text=text, photo_bytes=None, history=history or [],
         vision_model="test-model",
+        pending_kind=pending_kind,
     )
 
 
@@ -178,6 +180,50 @@ async def test_onboarding_intent():
 
 
 # ============================================================
+# Pending proposal (Sprint 1+2)
+# ============================================================
+async def test_sim_with_pending_meal_routes_to_confirm():
+    """User responde 'Sim' quando há proposta de refeição pendente →
+    intent confirm_pending, tools restritas a confirm_proposal/cancel_proposal."""
+    d = await _classify_text_only("Sim", pending_kind="meal")
+    assert d.intent == "confirm_pending", f"esperado confirm_pending, veio {d.intent}"
+    assert d.allowed_tools is not None
+    assert "confirm_proposal" in d.allowed_tools
+    assert "log_meal" not in d.allowed_tools, \
+        "log_meal NÃO deve estar no menu — força confirm_proposal"
+
+
+async def test_nao_with_pending_meal_routes_to_cancel():
+    d = await _classify_text_only("não", pending_kind="meal")
+    assert d.intent == "cancel_pending", f"esperado cancel_pending, veio {d.intent}"
+    assert "cancel_proposal" in (d.allowed_tools or set())
+
+
+async def test_sim_without_pending_is_free_chat():
+    """Sem pending, 'Sim' isolado não vira confirm_pending — fica ambíguo (free_chat)."""
+    d = await _classify_text_only("Sim", pending_kind=None)
+    assert d.intent != "confirm_pending", "não pode ativar confirm_pending sem pending"
+
+
+async def test_loga_with_pending_routes_to_confirm():
+    """Variações de 'sim': 'loga', 'ok', 'pode'."""
+    for word in ["loga", "ok", "pode", "confirma", "vai", "salva"]:
+        d = await _classify_text_only(word, pending_kind="meal")
+        assert d.intent == "confirm_pending", \
+            f"'{word}' com pending deve ser confirm_pending, veio {d.intent}"
+
+
+async def test_long_response_with_pending_does_not_confirm():
+    """User responde longo com pending pendente → NÃO confirma automaticamente."""
+    d = await _classify_text_only(
+        "Sim, mas adiciona uma maçã também",
+        pending_kind="meal",
+    )
+    assert d.intent != "confirm_pending", \
+        "frase longa após 'sim' não pode disparar confirm automático"
+
+
+# ============================================================
 # Runner
 # ============================================================
 ALL_TESTS = [
@@ -193,6 +239,11 @@ ALL_TESTS = [
     test_ambiguous_plate_with_choose_question,
     test_image_classifier_low_confidence_falls_back,
     test_onboarding_intent,
+    test_sim_with_pending_meal_routes_to_confirm,
+    test_nao_with_pending_meal_routes_to_cancel,
+    test_sim_without_pending_is_free_chat,
+    test_loga_with_pending_routes_to_confirm,
+    test_long_response_with_pending_does_not_confirm,
 ]
 
 

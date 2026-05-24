@@ -285,8 +285,11 @@ async def parse_menu(ctx: dict, photo_id: str | None = None) -> dict:
 @tool(
     name="log_meal",
     description=(
-        "Salva uma refeição no diário do usuário. Use SOMENTE após o user "
-        "confirmar os items e porções. Geralmente vem após estimate_meal_from_photo."
+        "Salva uma refeição no diário do usuário. Use APENAS para 'log direto sem "
+        "negociação' (ex: template, item único do TACO já confirmado). Para o caso "
+        "comum 'apresentar pro user e esperar confirmação', use propose_meal — ele "
+        "salva como pendente e o bot mostra botões [✅ Logar / ❌ Cancelar]. "
+        "log_meal pula a etapa de confirmação."
     ),
     parameters={
         "type": "object",
@@ -310,21 +313,55 @@ async def parse_menu(ctx: dict, photo_id: str | None = None) -> dict:
                 },
             },
             "notes": {"type": "string"},
+            "eaten_at": {
+                "type": "string",
+                "description": (
+                    "ISO 8601 opcional (ex: '2026-05-23T19:00:00-03:00' ou '2026-05-23T19:00'). "
+                    "Use quando o user disser 'ontem', 'ontem 19h', '23/05 12h', etc. "
+                    "Omita se for AGORA."
+                ),
+            },
         },
         "required": ["items"],
     },
 )
-async def log_meal(ctx: dict, items: list, notes: str | None = None) -> dict:
-    totals = {
+async def log_meal(ctx: dict, items: list, notes: str | None = None,
+                   eaten_at: str | None = None) -> dict:
+    totals = _sum_totals(items)
+    norm_items = _normalize_meal_items(items)
+    parsed_eaten = _parse_iso_safe(eaten_at)
+    meal_id = await db.insert_meal(
+        user_id=ctx["user_id"],
+        vision_model=ctx.get("vision_model", "agent"),
+        photo_file_id=None,
+        items=norm_items,
+        totals=totals,
+        notes=notes,
+        eaten_at=parsed_eaten,
+    )
+    await _attach_daily_chart_to_scratchpad(ctx)
+    return {
+        "meal_id": meal_id,
+        "totals": totals,
+        "eaten_at": (parsed_eaten or datetime.now(timezone.utc)).isoformat(),
+        "daily_chart_attached": True,
+    }
+
+
+# Helpers usados por log_meal + propose_meal + confirm_proposal
+def _sum_totals(items: list) -> dict:
+    return {
         "kcal": round(sum(float(i["kcal"]) for i in items), 1),
         "protein_g": round(sum(float(i["protein_g"]) for i in items), 1),
         "carbs_g": round(sum(float(i["carbs_g"]) for i in items), 1),
         "fat_g": round(sum(float(i["fat_g"]) for i in items), 1),
     }
-    # normaliza items pro schema interno
-    norm_items = []
+
+
+def _normalize_meal_items(items: list) -> list[dict]:
+    out = []
     for it in items:
-        norm_items.append({
+        out.append({
             "name_llm": it["name"],
             "food_id": it.get("food_id"),
             "food_name": it.get("food_name"),
@@ -335,17 +372,20 @@ async def log_meal(ctx: dict, items: list, notes: str | None = None) -> dict:
             "fat_g": float(it["fat_g"]),
             "source": it.get("source", "agente"),
         })
-    meal_id = await db.insert_meal(
-        user_id=ctx["user_id"],
-        vision_model=ctx.get("vision_model", "agent"),
-        photo_file_id=None,
-        items=norm_items,
-        totals=totals,
-        notes=notes,
-    )
-    # Auto-anexa gráfico do dia pra acompanhar a confirmação
-    await _attach_daily_chart_to_scratchpad(ctx)
-    return {"meal_id": meal_id, "totals": totals, "daily_chart_attached": True}
+    return out
+
+
+def _parse_iso_safe(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        # Sem tz: assume UTC pra não invalidar. Agent recebe instrução pra mandar com offset.
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 # --------------------------------------------------------------
@@ -1293,6 +1333,149 @@ async def remember(ctx: dict, key: str, value: str) -> dict:
             key, value, ctx["conv_id"],
         )
     return {"ok": True, "remembered": {key: value}}
+
+
+# --------------------------------------------------------------
+# Propose / confirm / cancel — fluxo de 2 etapas com inline keyboard
+# --------------------------------------------------------------
+# Filosofia: quando o agente apresenta dados pro user confirmar, NUNCA conta
+# com "lembrar" os números entre turnos. Persistimos no scratchpad e na
+# confirmação o `confirm_proposal()` lê de lá — zero risco de hallucination
+# entre o turno da proposta e o turno da confirmação.
+import uuid
+
+
+def _gen_proposal_id() -> str:
+    return "p_" + uuid.uuid4().hex[:10]
+
+
+@tool(
+    name="propose_meal",
+    description=(
+        "Salva uma refeição como PENDENTE de confirmação. O bot mostra botões "
+        "[✅ Logar / 🕐 Horário / ❌ Cancelar] embaixo da sua mensagem. Use ISSO em vez "
+        "de log_meal quando você quer que o user confirme antes de gravar. "
+        "Depois desta tool, escreva a confirmação ('Tudo certo? Confirma logar?') "
+        "e PARE — não chame log_meal nem confirm_proposal você mesmo. O user "
+        "decide via botão ou texto ('sim'/'não'). "
+        "Sobrescreve qualquer proposta anterior."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "description": "Items finais (já com macros calculados, idem log_meal).",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "portion_g": {"type": "number"},
+                        "kcal": {"type": "number"},
+                        "protein_g": {"type": "number"},
+                        "carbs_g": {"type": "number"},
+                        "fat_g": {"type": "number"},
+                        "source": {"type": "string"},
+                        "food_id": {"type": "integer"},
+                        "food_name": {"type": "string"},
+                    },
+                    "required": ["name", "portion_g", "kcal", "protein_g", "carbs_g", "fat_g"],
+                },
+            },
+            "notes": {"type": "string"},
+            "eaten_at": {
+                "type": "string",
+                "description": (
+                    "ISO 8601 opcional. Quando o user disser 'ontem 19h', 'há 2 horas', "
+                    "'23/05 12h' etc, traduza pra ISO e mande aqui. Omita se for AGORA."
+                ),
+            },
+        },
+        "required": ["items"],
+    },
+)
+async def propose_meal(ctx: dict, items: list, notes: str | None = None,
+                       eaten_at: str | None = None) -> dict:
+    totals = _sum_totals(items)
+    norm_items = _normalize_meal_items(items)
+    parsed_eaten = _parse_iso_safe(eaten_at)
+    proposal = {
+        "kind": "meal",
+        "id": _gen_proposal_id(),
+        "items": norm_items,
+        "totals": totals,
+        "notes": notes,
+        "eaten_at_iso": parsed_eaten.isoformat() if parsed_eaten else None,
+        "created_at_iso": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.set_pending_proposal(ctx["conv_id"], proposal)
+    return {
+        "proposal_id": proposal["id"],
+        "kind": "meal",
+        "totals": totals,
+        "eaten_at_iso": proposal["eaten_at_iso"],
+        "items_count": len(norm_items),
+        "buttons_shown": True,
+        "next_step": (
+            "Escreva uma mensagem ao user mostrando o breakdown e perguntando "
+            "se quer confirmar. NÃO chame log_meal nem confirm_proposal — o "
+            "user vai clicar no botão (ou digitar 'sim'/'não')."
+        ),
+    }
+
+
+@tool(
+    name="confirm_proposal",
+    description=(
+        "Confirma e LOGA a proposta pendente (criada por propose_meal). Use APENAS "
+        "quando o user disse 'sim/loga/ok/confirma'. Lê os items exatos do scratchpad — "
+        "NÃO re-busque alimentos. Se não houver proposta pendente, retorna error."
+    ),
+    parameters={"type": "object", "properties": {}},
+)
+async def confirm_proposal(ctx: dict) -> dict:
+    proposal = await db.get_pending_proposal(ctx["conv_id"])
+    if not proposal:
+        return {"error": "Sem proposta pendente. Use propose_meal antes."}
+    kind = proposal.get("kind")
+    if kind == "meal":
+        eaten_at = _parse_iso_safe(proposal.get("eaten_at_iso"))
+        meal_id = await db.insert_meal(
+            user_id=ctx["user_id"],
+            vision_model=ctx.get("vision_model", "agent"),
+            photo_file_id=None,
+            items=proposal["items"],
+            totals=proposal["totals"],
+            notes=proposal.get("notes"),
+            eaten_at=eaten_at,
+        )
+        await db.clear_pending_proposal(ctx["conv_id"])
+        await _attach_daily_chart_to_scratchpad(ctx)
+        return {
+            "ok": True,
+            "kind": "meal",
+            "meal_id": meal_id,
+            "totals": proposal["totals"],
+            "eaten_at": (eaten_at or datetime.now(timezone.utc)).isoformat(),
+            "daily_chart_attached": True,
+        }
+    return {"error": f"Tipo de proposta '{kind}' ainda não suportado."}
+
+
+@tool(
+    name="cancel_proposal",
+    description=(
+        "Cancela a proposta pendente sem logar. Use quando user disse "
+        "'não/cancela/erra/deixa pra lá'."
+    ),
+    parameters={"type": "object", "properties": {}},
+)
+async def cancel_proposal(ctx: dict) -> dict:
+    proposal = await db.get_pending_proposal(ctx["conv_id"])
+    if not proposal:
+        return {"ok": True, "note": "Nada pendente, nada feito."}
+    await db.clear_pending_proposal(ctx["conv_id"])
+    return {"ok": True, "cancelled": proposal.get("id"), "kind": proposal.get("kind")}
 
 
 # --------------------------------------------------------------
